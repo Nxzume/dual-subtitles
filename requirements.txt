@@ -1,0 +1,4 @@
+pysubs2>=1.7.0
+openai>=1.40.0
+python-dotenv>=1.0.0
+tqdm>=4.66.0

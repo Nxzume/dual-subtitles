@@ -1,0 +1,25 @@
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Local media / generated subs (keep the tool, not your movies)
+*.srt
+*.vtt
+*.ass
+*.ssa
+*.mkv
+*.mp4
+*.avi
+*.mov
+*.m4v
+*.webm
+*.m2ts
+*.ts
+!examples/**
