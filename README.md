@@ -1,21 +1,21 @@
-# Dual Subs
+# Dual Subtitles
 
-Turn English subtitles into dual-language subtitles (e.g. English + Chinese) using an [NVIDIA NIM](https://build.nvidia.com) LLM.
+Build dual-language subtitle files for films and TV — translate with an [NVIDIA NIM](https://build.nvidia.com) LLM, merge two existing tracks by time, or extract soft subs from video.
 
 **Input:** `.srt` / `.vtt` / `.ass` / `.ssa`, or a video with soft subtitle tracks (`.mkv`, `.mp4`, …)  
-**Output** (next to the source file):
+**Output** (next to the source file, names depend on mode):
 
 | File | Contents |
 |---|---|
-| `movie.dual.srt` | English + Chinese on each cue |
-| `movie.en.srt` | Original English |
-| `movie.zh-CN.srt` | Chinese only |
+| `movie.dual.srt` | Both languages (default: overlap layout for Jellyfin Web) |
+| `movie.en.srt` | Source language only (translate mode) |
+| `movie.zh-CN.srt` | Target language only (translate mode) |
 
 ## Requirements
 
 - Python 3.10+
-- An NVIDIA API key ([build.nvidia.com](https://build.nvidia.com) — free tier, no credit card)
-- Optional: [ffmpeg](https://ffmpeg.org) on PATH (only needed to extract soft tracks from video)
+- An NVIDIA API key ([build.nvidia.com](https://build.nvidia.com) — free tier, no credit card) — **only for Translate (AI)**
+- Optional: [ffmpeg](https://ffmpeg.org) on PATH (extract soft tracks from video)
 
 ## Setup
 
@@ -30,19 +30,50 @@ Edit `.env` and set your key:
 NVIDIA_API_KEY=nvapi-...
 ```
 
-## Usage
+## Desktop UI
 
-**Desktop UI:** double-click `Dual Subs UI.bat` (or `python ui.py`).
+Double-click `Dual Subs UI.bat`, or run:
 
-**Drag & drop:** drop a subtitle/video onto `Drag Subtitles Here.bat`.
+```bash
+python ui.py
+```
 
-**CLI:**
+### Modes
+
+| Mode | What it does | API key |
+|---|---|---|
+| **Translate (AI)** | Translate a subtitle (or soft track from video) into a dual file | Required |
+| **Merge two files** | Fuse two existing language files by time overlap | Not needed |
+| **Extract from video** | Dump a soft text track to `.srt` | Not needed |
+
+### Options
+
+- **Source lang** — `auto` (detect from text) or a language code
+- **Target lang** — dropdown (zh-CN, zh-TW, en, ja, ko, …)
+- **Line order** — `source-top` or `target-top`
+- **Dual format** — `srt` (recommended for Jellyfin Web) or `ass`
+- **Dual layout** — `overlap` (best for Jellyfin Web), `stacked`, or `single-line`
+- **Context** — optional show/movie notes for the translator
+
+### Preview
+
+The Preview tab lists cues and timings after you pick a file. In Translate mode it also runs a short live sample (~8 cues) so you can check quality before a full run.
+
+Check **Show video preview** if you want a compact on-screen mockup of how dual lines look (off by default). Use **Prev cue** / **Next cue** to step through the sample.
+
+**Refresh preview** reloads the list/sample; **Open output folder** opens the folder of the input file; progress appears on the **Log** tab.
+
+## Drag & drop
+
+Drop a subtitle or video onto `Drag Subtitles Here.bat` for a quick translate run (same as the CLI defaults).
+
+## CLI
 
 ```bash
 # Subtitle file → dual subs (AI translate)
 python dual_subs.py movie.srt
 
-# Video with soft tracks → extract English track → dual subs
+# Video with soft tracks → extract preferred track → dual subs
 python dual_subs.py movie.mkv
 
 # Extract only (no translation)
@@ -69,7 +100,7 @@ python dual_subs.py movie.srt --context "The Amazing Spider-Man (2012), casual t
 |---|---|---|
 | `--source-lang` | `auto` | Source language, or `auto` to detect from text |
 | `--target-lang` | `zh-CN` | Target (`zh-CN` Simplified, `zh-TW` Traditional, …) |
-| `--order` | `source-top` | Dual layout: `source-top` or `target-top` |
+| `--order` | `source-top` | Line order: `source-top` or `target-top` |
 | `--format` | `srt` | Dual output: `srt` (use this for Jellyfin Web) or `ass` |
 | `--layout` | `overlap` | `overlap` (two cues, same time — best for Jellyfin Web), `stacked`, or `single-line` |
 | `--model` | `qwen/qwen3.5-397b-a17b` | NIM model id ([catalog](https://build.nvidia.com/models)) |
@@ -89,16 +120,20 @@ python dual_subs.py movie.srt --context "The Amazing Spider-Man (2012), casual t
 
 **Translate mode**
 1. Loads cues (or extracts a soft text track from video via `ffmpeg`).
-2. Sends numbered batches of lines to NVIDIA NIM in parallel.
-3. Reattaches translations to the original timings.
-4. Writes dual + single-language files.
+2. Detects source language when set to `auto`.
+3. Sends numbered batches of lines to NVIDIA NIM in parallel.
+4. Reattaches translations to the original timings.
+5. Writes dual + single-language files.
 
-**Merge mode** (`--merge`)
+**Merge mode** (`--merge` / UI “Merge two files”)
 1. Detects script family (Latin vs CJK) to pick a timing spine.
-2. Pairs cues by time overlap and writes a dual-line file.
+2. Pairs cues by time overlap and writes a dual file.
 3. Assumes both files are already timed to the same video (optional `--auto-shift` / `--shift-ms` only if not).
 
-Defaults to a large Qwen model for strong English↔Chinese quality. Smaller/faster models can be set with `--model`.
+**Extract mode**
+1. Uses `ffmpeg` to dump a soft text track to `.srt`.
+
+Defaults to a large Qwen model for strong bilingual quality. Smaller/faster models can be set with `--model`.
 
 Text soft tracks (`srt`, `ass`, `mov_text`, …) extract cleanly. Image-based tracks (`PGS`, `VobSub`) need OCR and are not supported.
 
@@ -138,5 +173,6 @@ Keep `movie.en.srt` + `movie.zh.srt` and use Jellyfin’s **primary + secondary*
 python dual_subs.py --merge en.srt zh.srt --format srt --layout overlap
 ```
 
-Name the file like the video, e.g. `Movie Name (2021).srt`, next to the media file, then scan the library.
+Or in the UI: **Merge two files**, Dual format `srt`, Dual layout `overlap`.
 
+Name the file like the video, e.g. `Movie Name (2021).srt`, next to the media file, then scan the library.
