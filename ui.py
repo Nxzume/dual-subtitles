@@ -184,11 +184,11 @@ class DualSubsApp(tk.Tk):
         ).grid(row=1, column=3, sticky=tk.W, padx=8)
 
         ttk.Label(opts, text="Dual layout").grid(row=2, column=0, sticky=tk.W, pady=4)
-        self.dual_layout = tk.StringVar(value="overlap")
+        self.dual_layout = tk.StringVar(value="stacked")
         layout_box = ttk.Combobox(
             opts,
             textvariable=self.dual_layout,
-            values=["overlap", "stacked", "single-line"],
+            values=["stacked", "single-line"],
             state="readonly",
             width=14,
         )
@@ -385,7 +385,7 @@ class DualSubsApp(tk.Tk):
             return
 
         top, bottom, time_label = self._player_cues[self._player_index]
-        layout = self.dual_layout.get() or "overlap"
+        layout = self.dual_layout.get() or "stacked"
         self.player_cue_label.configure(
             text=f"Cue {self._player_index + 1}/{len(self._player_cues)}  ·  {time_label}"
         )
@@ -585,7 +585,7 @@ class DualSubsApp(tk.Tk):
         if token != self._preview_token:
             return
 
-        layout = self.dual_layout.get() or "overlap"
+        layout = self.dual_layout.get() or "stacked"
         self.preview_meta.configure(
             text=f"{path.name}  ·  sample dual preview  ·  {src} → {tgt}  ·  layout={layout}"
         )
@@ -723,7 +723,7 @@ class DualSubsApp(tk.Tk):
             min_overlap_ms=80,
             drop_unmatched=False,
             format=self.dual_format.get() or "srt",
-            layout=self.dual_layout.get() or "overlap",
+            layout=self.dual_layout.get() or "stacked",
         )
 
     def _run(self):

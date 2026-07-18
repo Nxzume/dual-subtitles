@@ -427,20 +427,19 @@ def clean_sub_text(text: str) -> str:
     return _INVISIBLE_RE.sub("", text or "").strip()
 
 
-def prepare_dual_output(subs: pysubs2.SSAFile, fmt: str, layout: str = "overlap") -> pysubs2.SSAFile:
+def prepare_dual_output(subs: pysubs2.SSAFile, fmt: str, layout: str = "stacked") -> pysubs2.SSAFile:
     """
     Prepare dual subs for saving.
 
     layout:
-      - overlap: two cues with the SAME timestamps (one language each).
-        Best for Jellyfin Web — it draws both active cues, with CJK font fallback.
-      - stacked: one cue, two lines (\\N / newline). VLC-friendly; often only
-        one line shows in Jellyfin Web.
-      - single-line: one cue, "ZH  |  EN" on one line. Jellyfin Web often
-        truncates long lines so only the first language is visible.
+      - stacked: one cue, two lines (\\N / newline). Default; works in most players.
+      - single-line: one cue, "ZH  |  EN" on one line. Some players truncate long lines.
     """
     fmt = (fmt or "srt").lower().lstrip(".")
-    layout = (layout or "overlap").lower()
+    layout = (layout or "stacked").lower()
+    if layout == "overlap":
+        # Removed: concurrent same-time cues interleaved badly with multi-line source.
+        layout = "stacked"
 
     # Normalize text and strip invisible marks first.
     base = copy.deepcopy(subs)
@@ -449,39 +448,15 @@ def prepare_dual_output(subs: pysubs2.SSAFile, fmt: str, layout: str = "overlap"
         parts = [p for p in parts if p]
         event.plaintext = "\n".join(parts)
 
-    if layout == "overlap":
-        out = pysubs2.SSAFile()
-        out.info = copy.deepcopy(base.info)
-        out.styles = copy.deepcopy(base.styles)
-        for event in base:
-            parts = [p for p in (event.plaintext or "").split("\n") if p]
-            if not parts:
-                continue
-            if len(parts) == 1:
-                e = copy.deepcopy(event)
-                e.plaintext = parts[0]
-                out.append(e)
-                continue
-            # Two (or more) languages → separate cues, identical timing.
-            # Jellyfin Web stacks concurrently active SRT cues.
-            top = copy.deepcopy(event)
-            bottom = copy.deepcopy(event)
-            top.plaintext = parts[0]
-            bottom.plaintext = " ".join(parts[1:])
-            out.append(top)
-            out.append(bottom)
-        out.sort()
-        prepared = out
-    else:
-        prepared = base
-        for event in prepared:
-            parts = [p for p in (event.plaintext or "").split("\n") if p]
-            if not parts:
-                event.plaintext = ""
-            elif layout == "stacked" and len(parts) >= 2:
-                event.plaintext = "\n".join(parts)
-            else:
-                event.plaintext = "  |  ".join(parts)
+    prepared = base
+    for event in prepared:
+        parts = [p for p in (event.plaintext or "").split("\n") if p]
+        if not parts:
+            event.plaintext = ""
+        elif layout == "stacked" and len(parts) >= 2:
+            event.plaintext = "\n".join(parts)
+        else:
+            event.plaintext = "  |  ".join(parts)
 
     if fmt != "ass":
         return prepared
@@ -504,15 +479,10 @@ def prepare_dual_output(subs: pysubs2.SSAFile, fmt: str, layout: str = "overlap"
     prepared.styles.clear()
     prepared.styles["Default"] = style
 
-    # For overlap ASS, push the first language slightly higher so they don't cover each other.
-    for i, event in enumerate(prepared):
+    for event in prepared:
         event.style = "Default"
         text = clean_sub_text(event.plaintext)
-        if layout == "overlap":
-            # Keep first language a bit higher so the two cues don't fully cover.
-            event.marginv = 55 if i % 2 == 0 else 20
-            event.text = _ass_escape(text)
-        elif "\n" in (event.plaintext or ""):
+        if "\n" in (event.plaintext or ""):
             parts = [p for p in event.plaintext.split("\n") if p]
             event.text = "\\N".join(_ass_escape(p) for p in parts)
         else:
@@ -527,7 +497,7 @@ def dual_output_path(base: Path, fmt: str) -> Path:
     return base.with_name(f"{base.stem}.dual.srt")
 
 
-def save_dual(subs: pysubs2.SSAFile, path: Path, fmt: str, layout: str = "overlap") -> Path:
+def save_dual(subs: pysubs2.SSAFile, path: Path, fmt: str, layout: str = "stacked") -> Path:
     fmt = (fmt or "srt").lower().lstrip(".")
     prepared = prepare_dual_output(subs, fmt, layout=layout)
     out_path = path
@@ -825,7 +795,7 @@ def process_merge(args, path_a: Path, path_b: Path):
     )
 
     fmt = getattr(args, "format", "srt") or "srt"
-    layout = getattr(args, "layout", "overlap") or "overlap"
+    layout = getattr(args, "layout", "stacked") or "stacked"
     out = args.output
     if out:
         out_path = Path(out)
@@ -839,11 +809,6 @@ def process_merge(args, path_a: Path, path_b: Path):
     out_path = save_dual(dual, out_path, fmt, layout=layout)
     matched = sum(1 for e in dual if "\n" in (e.plaintext or ""))
     print(f"  -> {out_path.name}  ({len(dual)} cues, {matched} stacked-source cues, format={fmt}, layout={layout})")
-    if fmt == "srt" and layout == "overlap":
-        print(
-            "  Tip (Jellyfin Web): if Chinese shows as ☐☐☐, set Dashboard → Playback → Fallback fonts "
-            "(Noto Sans SC .woff2). The .srt is fine — the web player needs a CJK font."
-        )
 
 
 def process_file(client, args, path: Path):
@@ -887,7 +852,7 @@ def process_file(client, args, path: Path):
 
     stem, ext = sub_path.stem, sub_path.suffix
     fmt = getattr(args, "format", "srt") or "srt"
-    layout = getattr(args, "layout", "overlap") or "overlap"
+    layout = getattr(args, "layout", "stacked") or "stacked"
     dual_path = dual_output_path(sub_path, fmt)
     target_path = sub_path.with_name(f"{stem}.{args.target_lang}{ext}")
     source_path = sub_path.with_name(f"{stem}.{source_lang}{ext}")
@@ -959,9 +924,9 @@ def parse_args():
     )
     parser.add_argument(
         "--layout",
-        choices=["overlap", "stacked", "single-line"],
-        default="overlap",
-        help="Dual layout: overlap (two cues, same timing — best for Jellyfin Web), stacked, or single-line",
+        choices=["stacked", "single-line"],
+        default="stacked",
+        help="Dual layout: stacked (two lines per cue) or single-line (ZH | EN)",
     )
     parser.add_argument("--model", default=DEFAULT_MODEL, help=f"NVIDIA NIM model id (default: {DEFAULT_MODEL})")
     parser.add_argument("--batch-size", type=int, default=20, help="Subtitle lines per API request (default: 20)")

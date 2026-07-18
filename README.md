@@ -7,7 +7,7 @@ Build dual-language subtitle files for films and TV — translate with an [NVIDI
 
 | File | Contents |
 |---|---|
-| `movie.dual.srt` | Both languages (default: overlap layout for Jellyfin Web) |
+| `movie.dual.srt` | Both languages (default: stacked — two lines per cue) |
 | `movie.en.srt` | Source language only (translate mode) |
 | `movie.zh-CN.srt` | Target language only (translate mode) |
 
@@ -51,8 +51,8 @@ python ui.py
 - **Source lang** — `auto` (detect from text) or a language code
 - **Target lang** — dropdown (zh-CN, zh-TW, en, ja, ko, …)
 - **Line order** — `source-top` or `target-top`
-- **Dual format** — `srt` (recommended for Jellyfin Web) or `ass`
-- **Dual layout** — `overlap` (best for Jellyfin Web), `stacked`, or `single-line`
+- **Dual format** — `srt` or `ass`
+- **Dual layout** — `stacked` (two lines per cue, default) or `single-line` (`ZH | EN`)
 - **Context** — optional show/movie notes for the translator
 
 ### Preview
@@ -101,8 +101,8 @@ python dual_subs.py movie.srt --context "The Amazing Spider-Man (2012), casual t
 | `--source-lang` | `auto` | Source language, or `auto` to detect from text |
 | `--target-lang` | `zh-CN` | Target (`zh-CN` Simplified, `zh-TW` Traditional, …) |
 | `--order` | `source-top` | Line order: `source-top` or `target-top` |
-| `--format` | `srt` | Dual output: `srt` (use this for Jellyfin Web) or `ass` |
-| `--layout` | `overlap` | `overlap` (two cues, same time — best for Jellyfin Web), `stacked`, or `single-line` |
+| `--format` | `srt` | Dual output: `srt` or `ass` |
+| `--layout` | `stacked` | `stacked` (two lines per cue) or `single-line` |
 | `--model` | `qwen/qwen3.5-397b-a17b` | NIM model id ([catalog](https://build.nvidia.com/models)) |
 | `--batch-size` | `20` | Cues per API request |
 | `--workers` | `6` | Parallel API requests |
@@ -145,7 +145,7 @@ Text soft tracks (`srt`, `ass`, `mov_text`, …) extract cleanly. Image-based tr
 
 ## Jellyfin Web (Chinese as ☐☐☐ boxes)
 
-Dual **timing** can work (`--format srt --layout overlap`). If Chinese shows as empty boxes while English is fine, that is **not** a bad `.srt` — Jellyfin Web is missing a CJK font for subtitle rendering.
+Dual files use **stacked** layout by default (two lines in one cue). If Chinese shows as empty boxes while English is fine, that is **not** a bad `.srt` — Jellyfin Web is missing a CJK font for subtitle rendering. Jellyfin Web may also only show one of the two stacked lines; if so, use burn-in or two separate tracks (below).
 
 ### Fix 1 — Fallback fonts (official, best)
 
@@ -154,7 +154,7 @@ Dual **timing** can work (`--format srt --layout overlap`). If Chinese shows as 
    - Enable fallback fonts
    - Point at a folder that contains the `.woff2` / `.ttf` (total folder size limit ~20 MB)
 3. Restart Jellyfin / hard-refresh the web client
-4. Play again with your `.dual.srt` (`overlap` layout)
+4. Play again with your `.dual.srt`
 
 Docs: [Fallback fonts](https://jellyfin.org/docs/general/administration/configuration#fallback-fonts) · [Text not rendering](https://jellyfin.org/docs/general/administration/troubleshooting#text-not-rendering-properly)
 
@@ -170,9 +170,9 @@ Keep `movie.en.srt` + `movie.zh.srt` and use Jellyfin’s **primary + secondary*
 ### What this tool should output for Jellyfin
 
 ```bash
-python dual_subs.py --merge en.srt zh.srt --format srt --layout overlap
+python dual_subs.py --merge en.srt zh.srt --format srt --layout stacked
 ```
 
-Or in the UI: **Merge two files**, Dual format `srt`, Dual layout `overlap`.
+Or in the UI: **Merge two files**, Dual format `srt`, Dual layout `stacked`.
 
 Name the file like the video, e.g. `Movie Name (2021).srt`, next to the media file, then scan the library.
