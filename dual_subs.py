@@ -8,12 +8,15 @@ Usage:
     python dual_subs.py movie.mkv --extract-only     # just dump the soft track to .srt
     python dual_subs.py movie.mkv --sub-stream 1     # pick a specific soft track
     python dual_subs.py movie.srt --target-lang zh-TW --order target-top
+    python dual_subs.py --merge en.srt zh.srt        # fuse two existing language tracks
     (or drag & drop .srt/.vtt/.ass/.ssa/.mkv/.mp4 onto "Drag Subtitles Here.bat")
 
 For each input "movie.srt" this produces, next to the original file:
     movie.dual.srt   - combined two-line-per-cue dual subtitle
     movie.en.srt     - exact copy of the original (source language only)
     movie.zh-CN.srt  - translation only, in the target language
+
+With --merge, only a dual file is written (timings synced by overlap).
 """
 
 import argparse
@@ -56,6 +59,7 @@ DEFAULT_MODEL = os.environ.get("NVIDIA_MODEL", "qwen/qwen3.5-397b-a17b")
 DEFAULT_BASE_URL = os.environ.get("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1")
 
 LANG_NAMES = {
+    "auto": "Auto-detect",
     "en": "English",
     "zh-CN": "Simplified Chinese",
     "zh-TW": "Traditional Chinese",
@@ -64,7 +68,35 @@ LANG_NAMES = {
     "es": "Spanish",
     "fr": "French",
     "de": "German",
+    "pt": "Portuguese",
+    "ru": "Russian",
+    "ar": "Arabic",
+    "hi": "Hindi",
+    "th": "Thai",
+    "vi": "Vietnamese",
+    "it": "Italian",
+    "nl": "Dutch",
 }
+
+# Common translate targets for UI pickers (code, label).
+TARGET_LANG_CHOICES = [
+    ("zh-CN", "Simplified Chinese (zh-CN)"),
+    ("zh-TW", "Traditional Chinese (zh-TW)"),
+    ("en", "English (en)"),
+    ("ja", "Japanese (ja)"),
+    ("ko", "Korean (ko)"),
+    ("es", "Spanish (es)"),
+    ("fr", "French (fr)"),
+    ("de", "German (de)"),
+    ("pt", "Portuguese (pt)"),
+    ("ru", "Russian (ru)"),
+    ("ar", "Arabic (ar)"),
+    ("hi", "Hindi (hi)"),
+    ("th", "Thai (th)"),
+    ("vi", "Vietnamese (vi)"),
+    ("it", "Italian (it)"),
+    ("nl", "Dutch (nl)"),
+]
 
 ENCODINGS_TO_TRY = ["utf-8-sig", "utf-8", "cp1252", "gb18030", "latin-1"]
 
@@ -219,9 +251,12 @@ def extract_soft_subs(video_path: Path, prefer_lang: str | None = None, stream_i
 def resolve_input(path: Path, args) -> Path:
     """If path is a video, extract soft subs first; otherwise return as-is."""
     if path.suffix.lower() in VIDEO_EXTS:
+        prefer = getattr(args, "source_lang", None)
+        if prefer and str(prefer).lower() in {"", "auto", "detect"}:
+            prefer = "en"  # best-effort track preference before we can read text
         return extract_soft_subs(
             path,
-            prefer_lang=args.source_lang,
+            prefer_lang=prefer,
             stream_index=args.sub_stream,
         )
     return path
@@ -379,6 +414,438 @@ def build_dual_and_target(subs: pysubs2.SSAFile, translations, order: str):
     return dual, target_only
 
 
+def _ass_escape(text: str) -> str:
+    return (text or "").replace("\\", "\\\\").replace("{", "\\{").replace("}", "\\}")
+
+
+# BOM / bidi / zero-width marks that leak out of some Chinese subtitle files and
+# confuse players (and can make mixed CN+EN lines look like "only one language").
+_INVISIBLE_RE = re.compile("[\u200b-\u200f\u202a-\u202e\u2060\ufeff]")
+
+
+def clean_sub_text(text: str) -> str:
+    return _INVISIBLE_RE.sub("", text or "").strip()
+
+
+def prepare_dual_output(subs: pysubs2.SSAFile, fmt: str, layout: str = "overlap") -> pysubs2.SSAFile:
+    """
+    Prepare dual subs for saving.
+
+    layout:
+      - overlap: two cues with the SAME timestamps (one language each).
+        Best for Jellyfin Web — it draws both active cues, with CJK font fallback.
+      - stacked: one cue, two lines (\\N / newline). VLC-friendly; often only
+        one line shows in Jellyfin Web.
+      - single-line: one cue, "ZH  |  EN" on one line. Jellyfin Web often
+        truncates long lines so only the first language is visible.
+    """
+    fmt = (fmt or "srt").lower().lstrip(".")
+    layout = (layout or "overlap").lower()
+
+    # Normalize text and strip invisible marks first.
+    base = copy.deepcopy(subs)
+    for event in base:
+        parts = [clean_sub_text(p) for p in (event.plaintext or "").split("\n")]
+        parts = [p for p in parts if p]
+        event.plaintext = "\n".join(parts)
+
+    if layout == "overlap":
+        out = pysubs2.SSAFile()
+        out.info = copy.deepcopy(base.info)
+        out.styles = copy.deepcopy(base.styles)
+        for event in base:
+            parts = [p for p in (event.plaintext or "").split("\n") if p]
+            if not parts:
+                continue
+            if len(parts) == 1:
+                e = copy.deepcopy(event)
+                e.plaintext = parts[0]
+                out.append(e)
+                continue
+            # Two (or more) languages → separate cues, identical timing.
+            # Jellyfin Web stacks concurrently active SRT cues.
+            top = copy.deepcopy(event)
+            bottom = copy.deepcopy(event)
+            top.plaintext = parts[0]
+            bottom.plaintext = " ".join(parts[1:])
+            out.append(top)
+            out.append(bottom)
+        out.sort()
+        prepared = out
+    else:
+        prepared = base
+        for event in prepared:
+            parts = [p for p in (event.plaintext or "").split("\n") if p]
+            if not parts:
+                event.plaintext = ""
+            elif layout == "stacked" and len(parts) >= 2:
+                event.plaintext = "\n".join(parts)
+            else:
+                event.plaintext = "  |  ".join(parts)
+
+    if fmt != "ass":
+        return prepared
+
+    style = pysubs2.SSAStyle()
+    style.fontname = "Noto Sans SC"
+    style.fontsize = 16
+    style.primarycolor = pysubs2.Color(255, 255, 255, 0)
+    style.secondarycolor = pysubs2.Color(255, 255, 255, 0)
+    style.outlinecolor = pysubs2.Color(0, 0, 0, 0)
+    style.backcolor = pysubs2.Color(0, 0, 0, 0)
+    style.bold = False
+    style.outline = 1
+    style.shadow = 0
+    style.borderstyle = 1
+    style.alignment = pysubs2.Alignment.BOTTOM_CENTER
+    style.marginl = 10
+    style.marginr = 10
+    style.marginv = 20
+    prepared.styles.clear()
+    prepared.styles["Default"] = style
+
+    # For overlap ASS, push the first language slightly higher so they don't cover each other.
+    for i, event in enumerate(prepared):
+        event.style = "Default"
+        text = clean_sub_text(event.plaintext)
+        if layout == "overlap":
+            # Keep first language a bit higher so the two cues don't fully cover.
+            event.marginv = 55 if i % 2 == 0 else 20
+            event.text = _ass_escape(text)
+        elif "\n" in (event.plaintext or ""):
+            parts = [p for p in event.plaintext.split("\n") if p]
+            event.text = "\\N".join(_ass_escape(p) for p in parts)
+        else:
+            event.text = _ass_escape(text)
+    return prepared
+
+
+def dual_output_path(base: Path, fmt: str) -> Path:
+    fmt = (fmt or "srt").lower().lstrip(".")
+    if fmt == "ass":
+        return base.with_name(f"{base.stem}.dual.ass")
+    return base.with_name(f"{base.stem}.dual.srt")
+
+
+def save_dual(subs: pysubs2.SSAFile, path: Path, fmt: str, layout: str = "overlap") -> Path:
+    fmt = (fmt or "srt").lower().lstrip(".")
+    prepared = prepare_dual_output(subs, fmt, layout=layout)
+    out_path = path
+    if fmt == "ass" and out_path.suffix.lower() not in {".ass", ".ssa"}:
+        out_path = out_path.with_suffix(".ass")
+    if fmt == "srt" and out_path.suffix.lower() != ".srt":
+        out_path = out_path.with_suffix(".srt")
+    if fmt == "ass":
+        prepared.save(str(out_path), format_="ass")
+    else:
+        prepared.save(str(out_path), format_="srt")
+    return out_path
+
+
+# --- Merge / fuse two existing subtitle files ---------------------------------
+
+CJK_RE = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uac00-\ud7af]")
+LATIN_RE = re.compile(r"[A-Za-z]")
+
+
+def detect_script(subs: pysubs2.SSAFile) -> str:
+    """Rough script family from cue text: 'cjk', 'latin', or 'unknown'."""
+    cjk = latin = 0
+    for event in subs:
+        text = event.plaintext or ""
+        cjk += len(CJK_RE.findall(text))
+        latin += len(LATIN_RE.findall(text))
+    if cjk == 0 and latin == 0:
+        return "unknown"
+    if cjk >= latin * 0.35:
+        return "cjk"
+    if latin > cjk:
+        return "latin"
+    return "unknown"
+
+
+_HANGUL_RE = re.compile(r"[\uac00-\ud7af]")
+_HIRAGANA_RE = re.compile(r"[\u3040-\u309f]")
+_KATAKANA_RE = re.compile(r"[\u30a0-\u30ff]")
+_CJK_UNIFIED_RE = re.compile(r"[\u4e00-\u9fff]")
+_CYRILLIC_RE = re.compile(r"[\u0400-\u04ff]")
+_ARABIC_RE = re.compile(r"[\u0600-\u06ff]")
+_THAI_RE = re.compile(r"[\u0e00-\u0e7f]")
+_DEVANAGARI_RE = re.compile(r"[\u0900-\u097f]")
+# Traditional-leaning characters that rarely appear in Simplified-only text.
+_TRAD_HINT_RE = re.compile(r"[繁體體後發國學門開關東車風頭過還來時會對點說]")
+
+
+def detect_language(subs: pysubs2.SSAFile) -> str:
+    """
+    Best-effort language code from subtitle text (no extra dependencies).
+    Returns codes like en, zh-CN, zh-TW, ja, ko, es is NOT distinguished from
+    other Latin languages — Latin defaults to en.
+    """
+    hangul = hiragana = katakana = cjk = cyrillic = arabic = thai = deva = latin = trad_hints = 0
+    sample = []
+    for i, event in enumerate(subs):
+        if i > 400:
+            break
+        sample.append(event.plaintext or "")
+    blob = "\n".join(sample)
+
+    hangul = len(_HANGUL_RE.findall(blob))
+    hiragana = len(_HIRAGANA_RE.findall(blob))
+    katakana = len(_KATAKANA_RE.findall(blob))
+    cjk = len(_CJK_UNIFIED_RE.findall(blob))
+    cyrillic = len(_CYRILLIC_RE.findall(blob))
+    arabic = len(_ARABIC_RE.findall(blob))
+    thai = len(_THAI_RE.findall(blob))
+    deva = len(_DEVANAGARI_RE.findall(blob))
+    latin = len(LATIN_RE.findall(blob))
+    trad_hints = len(_TRAD_HINT_RE.findall(blob))
+
+    scores = {
+        "ko": hangul,
+        "ja": hiragana + katakana,
+        "zh": cjk,
+        "ru": cyrillic,
+        "ar": arabic,
+        "th": thai,
+        "hi": deva,
+        "en": latin,
+    }
+    # Japanese often mixes kanji + kana; boost ja when kana present with CJK.
+    if hiragana + katakana > 20 and cjk > 0:
+        scores["ja"] = hiragana + katakana + cjk * 0.5
+        scores["zh"] = cjk * 0.3
+
+    best = max(scores, key=scores.get)
+    if scores[best] < 10:
+        return "en"
+    if best == "zh":
+        # Rough Simplified vs Traditional guess.
+        return "zh-TW" if trad_hints >= max(8, cjk * 0.02) else "zh-CN"
+    return best
+
+
+def resolve_source_lang(subs: pysubs2.SSAFile, source_lang: str) -> str:
+    """Return concrete language code; auto-detect when source_lang is auto/empty."""
+    code = (source_lang or "auto").strip()
+    if code.lower() in {"", "auto", "detect"}:
+        detected = detect_language(subs)
+        print(f"  Auto-detected source language: {detected} ({lang_name(detected)})")
+        return detected
+    return code
+
+
+def _overlap_ms(a_start, a_end, b_start, b_end) -> int:
+    return max(0, min(a_end, b_end) - max(a_start, b_start))
+
+
+def _shift_subs(subs: pysubs2.SSAFile, shift_ms: int) -> pysubs2.SSAFile:
+    out = copy.deepcopy(subs)
+    if shift_ms:
+        out.shift(ms=shift_ms)
+    return out
+
+
+def estimate_time_shift(
+    primary: pysubs2.SSAFile,
+    secondary: pysubs2.SSAFile,
+    search_ms: int = 15000,
+    coarse_step_ms: int = 200,
+    fine_step_ms: int = 40,
+) -> int:
+    """
+    Estimate a constant millisecond offset to apply to secondary so it lines up
+    with primary, by maximizing total time-overlap across a search window.
+    """
+    if not primary or not secondary:
+        return 0
+
+    # Sample primary cues for speed on long movies.
+    step = max(1, len(primary) // 120)
+    sample = [(e.start, e.end) for i, e in enumerate(primary) if i % step == 0]
+    sec = [(e.start, e.end) for e in secondary]
+
+    def total_overlap(shift: int) -> int:
+        total = 0
+        j = 0
+        # Secondary is sorted by start; advance a pointer as we scan sample.
+        for a0, a1 in sample:
+            # Move j to first secondary that might overlap a after shift.
+            while j < len(sec) and sec[j][1] + shift < a0:
+                j += 1
+            k = j
+            while k < len(sec) and sec[k][0] + shift <= a1:
+                b0 = sec[k][0] + shift
+                b1 = sec[k][1] + shift
+                total += _overlap_ms(a0, a1, b0, b1)
+                k += 1
+        return total
+
+    # Coarse search for best shift (secondary relative to primary: try negative
+    # of offsets so applying +shift to secondary increases overlap).
+    # If secondary is late, we need negative shift to pull it back → search both signs.
+    best_shift, best_score = 0, total_overlap(0)
+    for shift in range(-search_ms, search_ms + 1, coarse_step_ms):
+        score = total_overlap(shift)
+        if score > best_score:
+            best_score, best_shift = score, shift
+
+    # Fine search around the coarse winner.
+    lo = best_shift - coarse_step_ms
+    hi = best_shift + coarse_step_ms
+    for shift in range(lo, hi + 1, fine_step_ms):
+        score = total_overlap(shift)
+        if score > best_score:
+            best_score, best_shift = score, shift
+
+    # Ignore tiny/noisy adjustments.
+    if abs(best_shift) < 60:
+        return 0
+    return int(best_shift)
+
+
+def _join_texts(texts):
+    parts = []
+    seen = set()
+    for t in texts:
+        t = clean_sub_text(t)
+        if not t or t in seen:
+            continue
+        seen.add(t)
+        parts.append(t)
+    return "\n".join(parts)
+
+
+def merge_subs(
+    primary: pysubs2.SSAFile,
+    secondary: pysubs2.SSAFile,
+    order: str = "source-top",
+    min_overlap_ms: int = 80,
+    include_unmatched: bool = True,
+) -> pysubs2.SSAFile:
+    """
+    Fuse two subtitle files into dual-line cues using time overlap.
+
+    Primary supplies the timing spine. For each primary cue, overlapping
+    secondary cue text is attached. Optionally append unmatched secondary cues.
+    """
+    dual = pysubs2.SSAFile()
+    # Preserve styles from primary when present (ASS).
+    dual.styles = copy.deepcopy(primary.styles)
+    dual.info = copy.deepcopy(primary.info)
+
+    used_secondary = set()
+
+    for p in primary:
+        matches = []
+        for si, s in enumerate(secondary):
+            ov = _overlap_ms(p.start, p.end, s.start, s.end)
+            if ov >= min_overlap_ms:
+                matches.append((ov, si, s))
+        matches.sort(key=lambda x: (-x[0], x[2].start))
+        other_text = _join_texts(s.plaintext for _, _, s in matches)
+        for _, si, _ in matches:
+            used_secondary.add(si)
+
+        p_text = (p.plaintext or "").strip()
+        if order == "target-top":
+            top, bottom = other_text, p_text
+        else:
+            top, bottom = p_text, other_text
+
+        if not top and not bottom:
+            continue
+        if top and bottom:
+            text = f"{top}\n{bottom}"
+        else:
+            text = top or bottom
+
+        event = copy.deepcopy(p)
+        event.plaintext = text
+        dual.append(event)
+
+    if include_unmatched:
+        for si, s in enumerate(secondary):
+            if si in used_secondary:
+                continue
+            text = (s.plaintext or "").strip()
+            if not text:
+                continue
+            event = copy.deepcopy(s)
+            event.plaintext = text
+            dual.append(event)
+
+    dual.sort()
+    return dual
+
+
+def process_merge(args, path_a: Path, path_b: Path):
+    print(f"\n=== merge: {path_a.name} + {path_b.name} ===")
+
+    # Allow video inputs: extract soft tracks first.
+    a = resolve_input(path_a, args) if path_a.suffix.lower() in VIDEO_EXTS else path_a
+    b = resolve_input(path_b, args) if path_b.suffix.lower() in VIDEO_EXTS else path_b
+    if a.suffix.lower() not in SUPPORTED_EXTS or b.suffix.lower() not in SUPPORTED_EXTS:
+        raise RuntimeError("Both merge inputs must be subtitle files (or videos with soft text tracks).")
+
+    subs_a = load_subs(a)
+    subs_b = load_subs(b)
+    script_a, script_b = detect_script(subs_a), detect_script(subs_b)
+    print(f"  {a.name}: {len(subs_a)} cues ({script_a})")
+    print(f"  {b.name}: {len(subs_b)} cues ({script_b})")
+
+    # Prefer Latin (usually English) as the timing spine / "source" line.
+    if script_a == "cjk" and script_b == "latin":
+        primary, secondary = subs_b, subs_a
+        primary_path, secondary_path = b, a
+        print("  Detected: Latin timing spine + CJK partner (swapped order)")
+    else:
+        primary, secondary = subs_a, subs_b
+        primary_path, secondary_path = a, b
+        if script_a == "latin" and script_b == "cjk":
+            print("  Detected: Latin timing spine + CJK partner")
+        else:
+            print("  Using first file as timing spine (could not confidently detect scripts)")
+
+    shift = args.shift_ms
+    if args.auto_shift:
+        estimated = estimate_time_shift(primary, secondary)
+        shift += estimated
+        print(f"  Auto sync offset for second track: {estimated:+d} ms")
+    if shift:
+        print(f"  Applying shift to second track: {shift:+d} ms")
+        secondary = _shift_subs(secondary, shift)
+
+    dual = merge_subs(
+        primary,
+        secondary,
+        order=args.order,
+        min_overlap_ms=args.min_overlap_ms,
+        include_unmatched=not args.drop_unmatched,
+    )
+
+    fmt = getattr(args, "format", "srt") or "srt"
+    layout = getattr(args, "layout", "overlap") or "overlap"
+    out = args.output
+    if out:
+        out_path = Path(out)
+        if fmt == "ass" and out_path.suffix.lower() not in {".ass", ".ssa"}:
+            out_path = out_path.with_suffix(".ass")
+        if fmt == "srt" and out_path.suffix.lower() != ".srt":
+            out_path = out_path.with_suffix(".srt")
+    else:
+        out_path = dual_output_path(primary_path, fmt)
+
+    out_path = save_dual(dual, out_path, fmt, layout=layout)
+    matched = sum(1 for e in dual if "\n" in (e.plaintext or ""))
+    print(f"  -> {out_path.name}  ({len(dual)} cues, {matched} stacked-source cues, format={fmt}, layout={layout})")
+    if fmt == "srt" and layout == "overlap":
+        print(
+            "  Tip (Jellyfin Web): if Chinese shows as ☐☐☐, set Dashboard → Playback → Fallback fonts "
+            "(Noto Sans SC .woff2). The .srt is fine — the web player needs a CJK font."
+        )
+
+
 def process_file(client, args, path: Path):
     print(f"\n=== {path.name} ===")
 
@@ -402,13 +869,14 @@ def process_file(client, args, path: Path):
     subs = load_subs(sub_path)
     lines = [event.plaintext for event in subs]
     print(f"  {len(lines)} cues loaded")
+    source_lang = resolve_source_lang(subs, args.source_lang)
     print(f"  batch_size={args.batch_size}, workers={args.workers}")
 
     translations = translate_all(
         client,
         args.model,
         lines,
-        args.source_lang,
+        source_lang,
         args.target_lang,
         args.context,
         args.batch_size,
@@ -418,11 +886,13 @@ def process_file(client, args, path: Path):
     dual_subs, target_subs = build_dual_and_target(subs, translations, args.order)
 
     stem, ext = sub_path.stem, sub_path.suffix
-    dual_path = sub_path.with_name(f"{stem}.dual{ext}")
+    fmt = getattr(args, "format", "srt") or "srt"
+    layout = getattr(args, "layout", "overlap") or "overlap"
+    dual_path = dual_output_path(sub_path, fmt)
     target_path = sub_path.with_name(f"{stem}.{args.target_lang}{ext}")
-    source_path = sub_path.with_name(f"{stem}.{args.source_lang}{ext}")
+    source_path = sub_path.with_name(f"{stem}.{source_lang}{ext}")
 
-    dual_subs.save(str(dual_path))
+    dual_path = save_dual(dual_subs, dual_path, fmt, layout=layout)
     target_subs.save(str(target_path))
     if sub_path.resolve() != source_path.resolve():
         shutil.copy2(str(sub_path), str(source_path))
@@ -439,13 +909,59 @@ def parse_args():
         nargs="*",
         help="Subtitle file(s) and/or video file(s) with soft subtitle tracks",
     )
-    parser.add_argument("--source-lang", default="en", help="Source language code (default: en)")
+    parser.add_argument(
+        "--merge",
+        nargs=2,
+        metavar=("FILE_A", "FILE_B"),
+        help="Fuse two existing subtitle (or video soft-track) files into one dual file by time sync",
+    )
+    parser.add_argument("-o", "--output", default=None, help="Output path for --merge (default: next to first/spine file)")
+    parser.add_argument(
+        "--shift-ms",
+        type=int,
+        default=0,
+        help="With --merge: shift the second track by this many milliseconds (after auto-shift if enabled)",
+    )
+    parser.add_argument(
+        "--auto-shift",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="With --merge: auto-estimate a global sync offset if tracks are misaligned (default: off).",
+    )
+    parser.add_argument(
+        "--min-overlap-ms",
+        type=int,
+        default=80,
+        help="With --merge: minimum overlap in ms to pair cues (default: 80)",
+    )
+    parser.add_argument(
+        "--drop-unmatched",
+        action="store_true",
+        help="With --merge: drop cues from the second file that don't overlap anything",
+    )
+    parser.add_argument(
+        "--source-lang",
+        default="auto",
+        help="Source language code, or 'auto' to detect from subtitle text (default: auto)",
+    )
     parser.add_argument("--target-lang", default="zh-CN", help="Target language code (default: zh-CN)")
     parser.add_argument(
         "--order",
         choices=["source-top", "target-top"],
         default="source-top",
-        help="Line order in the combined dual file (default: source-top)",
+        help="Line order in the combined dual file (default: source-top). For --merge, source = timing spine.",
+    )
+    parser.add_argument(
+        "--format",
+        choices=["srt", "ass"],
+        default="srt",
+        help="Dual subtitle output format (default: srt). Soft ASS cannot render CJK reliably in Jellyfin Web.",
+    )
+    parser.add_argument(
+        "--layout",
+        choices=["overlap", "stacked", "single-line"],
+        default="overlap",
+        help="Dual layout: overlap (two cues, same timing — best for Jellyfin Web), stacked, or single-line",
     )
     parser.add_argument("--model", default=DEFAULT_MODEL, help=f"NVIDIA NIM model id (default: {DEFAULT_MODEL})")
     parser.add_argument("--batch-size", type=int, default=20, help="Subtitle lines per API request (default: 20)")
@@ -471,6 +987,20 @@ def parse_args():
 
 def main():
     args = parse_args()
+
+    # --- Merge mode: fuse two existing language files (no API key needed) ---
+    if args.merge:
+        a, b = Path(args.merge[0]), Path(args.merge[1])
+        for p in (a, b):
+            if not p.exists():
+                sys.exit(f"ERROR: file not found: {p}")
+        try:
+            process_merge(args, a, b)
+        except Exception as e:
+            print(f"  [error] merge failed: {e}", file=sys.stderr)
+            sys.exit(1)
+        print("\nDone.")
+        return
 
     if not args.paths:
         print(__doc__)
