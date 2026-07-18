@@ -2,20 +2,21 @@
 setlocal
 cd /d "%~dp0"
 
-where py >nul 2>nul
-if %errorlevel%==0 (
-    py "%~dp0ui.py" %*
-    goto :end
+set "VENV_PY=%~dp0.venv\Scripts\python.exe"
+
+if not exist "%VENV_PY%" (
+    echo Virtual environment not found.
+    echo Run setup.bat first ^(creates .venv and installs requirements^).
+    echo.
+    pause
+    exit /b 1
 )
 
-where python >nul 2>nul
-if %errorlevel%==0 (
-    python "%~dp0ui.py" %*
-    goto :end
+"%VENV_PY%" "%~dp0dual_subs.py" --ui %*
+if errorlevel 1 (
+    echo.
+    echo App exited with an error.
+    pause
+    exit /b 1
 )
-
-echo ERROR: Python was not found on PATH.
-pause
-
-:end
 endlocal

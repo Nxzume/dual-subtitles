@@ -2,14 +2,15 @@
 dual_subs.py - Turn a movie/TV subtitle file into dual-language (e.g. English + Chinese)
 subtitles, translated via an NVIDIA NIM hosted LLM.
 
-Usage:
+CLI usage:
     python dual_subs.py movie.srt
-    python dual_subs.py movie.mkv                    # extract soft track, then translate
-    python dual_subs.py movie.mkv --extract-only     # just dump the soft track to .srt
-    python dual_subs.py movie.mkv --sub-stream 1     # pick a specific soft track
     python dual_subs.py movie.srt --target-lang zh-TW --order target-top
     python dual_subs.py --merge en.srt zh.srt        # fuse two existing language tracks
-    (or drag & drop .srt/.vtt/.ass/.ssa/.mkv/.mp4 onto "Drag Subtitles Here.bat")
+
+Desktop UI (no arguments):
+    Double-click Dual Subs UI.bat
+    python dual_subs.py
+    python dual_subs.py --ui
 
 For each input "movie.srt" this produces, next to the original file:
     movie.dual.srt   - combined two-line-per-cue dual subtitle
@@ -19,15 +20,20 @@ For each input "movie.srt" this produces, next to the original file:
 With --merge, only a dual file is written (timings synced by overlap).
 """
 
+from __future__ import annotations
+
 import argparse
 import copy
-import json
 import os
+import queue
+import random
 import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
+from argparse import Namespace
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -36,8 +42,23 @@ from dotenv import load_dotenv
 from openai import OpenAI
 from tqdm import tqdm
 
+try:
+    import tkinter as tk
+    from tkinter import filedialog, font as tkfont, messagebox, ttk
+
+    _HAS_TK = True
+except ImportError:  # headless environments (CLI must still work)
+    tk = None  # type: ignore[assignment]
+    filedialog = messagebox = ttk = tkfont = None  # type: ignore[assignment]
+    _HAS_TK = False
+
+# Load .env from the directory of this script explicitly (not just CWD), trying a
+# few encodings, then fall back to CWD discovery.
+_ENV_PATH = Path(__file__).resolve().parent / ".env"
 for _enc in ("utf-8", "utf-8-sig", "utf-16", "utf-16-le"):
     try:
+        if _ENV_PATH.exists() and load_dotenv(dotenv_path=_ENV_PATH, encoding=_enc):
+            break
         if load_dotenv(encoding=_enc) and os.environ.get("NVIDIA_API_KEY"):
             break
     except Exception:
@@ -53,10 +74,18 @@ for _stream in (sys.stdout, sys.stderr):
             pass
 
 SUPPORTED_EXTS = {".srt", ".vtt", ".ass", ".ssa"}
-VIDEO_EXTS = {".mkv", ".mp4", ".m4v", ".avi", ".mov", ".webm", ".m2ts", ".ts"}
-
-DEFAULT_MODEL = os.environ.get("NVIDIA_MODEL", "qwen/qwen3.5-397b-a17b")
+DEFAULT_MODEL = os.environ.get("NVIDIA_MODEL", "qwen/qwen2.5-72b-instruct")
 DEFAULT_BASE_URL = os.environ.get("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1")
+
+# Model ids offered in the UI picker. The env var NVIDIA_MODEL / --model still
+# overrides. The former default (qwen3.5-397b-a17b) is kept for continuity.
+MODEL_CHOICES = [
+    "qwen/qwen2.5-72b-instruct",
+    "qwen/qwen2.5-7b-instruct",
+    "qwen/qwen3.5-397b-a17b",
+    "meta/llama-3.1-70b-instruct",
+    "meta/llama-3.1-8b-instruct",
+]
 
 LANG_NAMES = {
     "auto": "Auto-detect",
@@ -98,7 +127,7 @@ TARGET_LANG_CHOICES = [
     ("nl", "Dutch (nl)"),
 ]
 
-ENCODINGS_TO_TRY = ["utf-8-sig", "utf-8", "cp1252", "gb18030", "latin-1"]
+ENCODINGS_TO_TRY = ["utf-8-sig", "utf-8", "utf-16", "utf-16-le", "utf-16-be", "cp1252", "gb18030", "latin-1"]
 
 SYSTEM_PROMPT_TMPL = """You are a professional subtitle translator for films and TV shows.
 Translate subtitle lines from {src} to {tgt}.
@@ -116,7 +145,7 @@ NNN|translated text
 No blank lines, no markdown, no extra text.
 {context}"""
 
-LINE_RE = re.compile(r"^(\d{1,4})\s*\|\s*(.*)$")
+LINE_RE = re.compile(r"^(\d+)\s*\|\s*(.*)$")
 
 
 def lang_name(code: str) -> str:
@@ -126,8 +155,8 @@ def lang_name(code: str) -> str:
 def get_client() -> OpenAI:
     api_key = os.environ.get("NVIDIA_API_KEY")
     if not api_key:
-        sys.exit(
-            "ERROR: NVIDIA_API_KEY is not set.\n"
+        raise RuntimeError(
+            "NVIDIA_API_KEY is not set.\n"
             "1. Get a free key at https://build.nvidia.com (sign in -> any model page -> Get API Key)\n"
             "2. Copy .env.example to .env and paste your key into it.\n"
         )
@@ -138,128 +167,18 @@ def load_subs(path: Path) -> pysubs2.SSAFile:
     last_err = None
     for enc in ENCODINGS_TO_TRY:
         try:
-            return pysubs2.load(str(path), encoding=enc)
+            subs = pysubs2.load(str(path), encoding=enc)
+            if enc == "latin-1":
+                print(
+                    f"  [warn] {path.name}: decoded as latin-1 fallback; "
+                    "characters may be garbled if the file is not really latin-1.",
+                    file=sys.stderr,
+                )
+            return subs
         except (UnicodeDecodeError, UnicodeError) as e:
             last_err = e
             continue
     raise last_err
-
-
-def _run_cmd(cmd):
-    return subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
-
-
-def list_subtitle_streams(video_path: Path):
-    """Return soft subtitle streams via ffprobe: [{index, codec, language, title}, ...]."""
-    cmd = [
-        "ffprobe",
-        "-v",
-        "error",
-        "-select_streams",
-        "s",
-        "-show_entries",
-        "stream=index,codec_name:stream_tags=language,title",
-        "-of",
-        "json",
-        str(video_path),
-    ]
-    result = _run_cmd(cmd)
-    if result.returncode != 0:
-        raise RuntimeError(
-            "ffprobe failed. Is ffmpeg/ffprobe installed and on PATH?\n" + (result.stderr or result.stdout)
-        )
-    data = json.loads(result.stdout or "{}")
-    streams = []
-    for i, stream in enumerate(data.get("streams") or []):
-        tags = stream.get("tags") or {}
-        streams.append(
-            {
-                "sub_index": i,  # 0-based among subtitle streams (for -map 0:s:N)
-                "stream_index": stream.get("index"),
-                "codec": stream.get("codec_name") or "unknown",
-                "language": (tags.get("language") or "und").lower(),
-                "title": tags.get("title") or "",
-            }
-        )
-    return streams
-
-
-def pick_subtitle_stream(streams, prefer_lang: str | None = None):
-    if not streams:
-        return None
-    if prefer_lang:
-        prefer = prefer_lang.lower().split("-")[0]
-        for s in streams:
-            if s["language"].startswith(prefer):
-                return s
-    # Prefer text-based codecs over image/bitmap (PGS/VobSub need OCR).
-    text_codecs = {"subrip", "srt", "ass", "ssa", "webvtt", "mov_text", "text", "subtitle"}
-    for s in streams:
-        if s["codec"].lower() in text_codecs:
-            return s
-    return streams[0]
-
-
-def extract_soft_subs(video_path: Path, prefer_lang: str | None = None, stream_index: int | None = None) -> Path:
-    """
-    Extract a soft subtitle track from a video into a sibling .srt/.ass file.
-    Returns the path of the extracted subtitle file.
-    """
-    streams = list_subtitle_streams(video_path)
-    if not streams:
-        raise RuntimeError(f"No soft subtitle tracks found in {video_path.name}")
-
-    print(f"  Found {len(streams)} soft subtitle track(s):")
-    for s in streams:
-        title = f' "{s["title"]}"' if s["title"] else ""
-        print(f"    [{s['sub_index']}] lang={s['language']} codec={s['codec']}{title}")
-
-    if stream_index is not None:
-        chosen = next((s for s in streams if s["sub_index"] == stream_index), None)
-        if chosen is None:
-            raise RuntimeError(f"Subtitle stream index {stream_index} not found (valid: 0-{len(streams)-1})")
-    else:
-        chosen = pick_subtitle_stream(streams, prefer_lang)
-
-    # Image-based tracks (PGS/dvd_subtitle) can't be dumped to plain .srt by ffmpeg alone.
-    image_codecs = {"hdmv_pgs_subtitle", "dvd_subtitle", "dvdsub", "pgssub", "xsub"}
-    if chosen["codec"].lower() in image_codecs:
-        raise RuntimeError(
-            f"Track [{chosen['sub_index']}] is image-based ({chosen['codec']}), not plain text. "
-            "Those need OCR — pick a text track with --sub-stream if one exists."
-        )
-
-    out_ext = ".ass" if chosen["codec"].lower() in {"ass", "ssa"} else ".srt"
-    out_path = video_path.with_name(f"{video_path.stem}.{chosen['language']}{out_ext}")
-
-    cmd = [
-        "ffmpeg",
-        "-y",
-        "-i",
-        str(video_path),
-        "-map",
-        f"0:s:{chosen['sub_index']}",
-        str(out_path),
-    ]
-    print(f"  Extracting track [{chosen['sub_index']}] ({chosen['language']}/{chosen['codec']}) -> {out_path.name}")
-    result = _run_cmd(cmd)
-    if result.returncode != 0 or not out_path.exists():
-        raise RuntimeError("ffmpeg extract failed:\n" + (result.stderr or result.stdout or "(no output)"))
-    return out_path
-
-
-def resolve_input(path: Path, args) -> Path:
-    """If path is a video, extract soft subs first; otherwise return as-is."""
-    if path.suffix.lower() in VIDEO_EXTS:
-        prefer = getattr(args, "source_lang", None)
-        if prefer and str(prefer).lower() in {"", "auto", "detect"}:
-            prefer = "en"  # best-effort track preference before we can read text
-        return extract_soft_subs(
-            path,
-            prefer_lang=prefer,
-            stream_index=args.sub_stream,
-        )
-    return path
 
 
 def _strip_think_tags(text: str) -> str:
@@ -284,7 +203,7 @@ def _parse_numbered(text: str, expected_indices: list):
             continue
         m = LINE_RE.match(raw)
         if m:
-            found[int(m.group(1))] = m.group(2)
+            found[int(m.group(1))] = m.group(2).replace(" / ", "\n")
 
     if all(i in found for i in expected_indices):
         return [found[i] for i in expected_indices]
@@ -294,7 +213,7 @@ def _parse_numbered(text: str, expected_indices: list):
     stripped = []
     for ln in plain:
         m = LINE_RE.match(ln)
-        stripped.append(m.group(2) if m else ln)
+        stripped.append((m.group(2) if m else ln).replace(" / ", "\n"))
     if len(stripped) == len(expected_indices):
         return stripped
 
@@ -311,6 +230,17 @@ def _message_text(choice) -> str:
         return content
     dump = msg.model_dump() if hasattr(msg, "model_dump") else {}
     return dump.get("reasoning_content") or dump.get("refusal") or ""
+
+
+def _retry_after_seconds(msg: str):
+    """Best-effort parse of a Retry-After hint from an error message, else None."""
+    m = re.search(r"retry[-\s]?after[\"':\s]+(\d+(?:\.\d+)?)", msg, flags=re.IGNORECASE)
+    if m:
+        try:
+            return float(m.group(1))
+        except ValueError:
+            return None
+    return None
 
 
 def translate_batch(client, model, lines, src, tgt, context, start_index=0, max_retries=3):
@@ -352,8 +282,21 @@ def translate_batch(client, model, lines, src, tgt, context, start_index=0, max_
             if is_align or (is_empty and attempt + 1 >= max_retries):
                 print(f"  [warn] batch@{start_index} n={len(lines)} failed ({e}); splitting...", file=sys.stderr)
                 break
-            wait = 1.5 if is_empty else 2 ** attempt
-            print(f"  [warn] batch@{start_index} n={len(lines)} failed ({e}); retrying in {wait}s...", file=sys.stderr)
+            is_rate = "429" in msg or "rate" in msg.lower()
+            jitter = random.uniform(0, 0.5)
+            if is_rate:
+                wait = _retry_after_seconds(msg)
+                if wait is None:
+                    wait = random.uniform(5, 20)
+            elif is_empty:
+                wait = 1.5
+            else:
+                wait = 2 ** attempt
+            wait += jitter
+            print(
+                f"  [warn] batch@{start_index} n={len(lines)} failed ({e}); retrying in {wait:.1f}s...",
+                file=sys.stderr,
+            )
             time.sleep(wait)
 
     if len(lines) == 1:
@@ -367,32 +310,87 @@ def translate_batch(client, model, lines, src, tgt, context, start_index=0, max_
     )
 
 
-def translate_all(client, model, lines, src, tgt, context, batch_size, workers=6):
-    """Extract cues -> translate numbered batches in parallel -> reassemble in order."""
+def translate_all(
+    client,
+    model,
+    lines,
+    src,
+    tgt,
+    context,
+    batch_size,
+    workers=6,
+    cancel_event: "threading.Event | None" = None,
+    progress_cb=None,
+):
+    """Extract cues -> translate numbered batches in parallel -> reassemble in order.
+
+    Empty/whitespace-only cues pass through as "". Identical non-empty cues are
+    translated once and mapped back. Supports cooperative cancellation via
+    cancel_event and progress reporting via progress_cb(done_batches, total_batches).
+    """
+
+    def _cancelled() -> bool:
+        return cancel_event is not None and cancel_event.is_set()
+
+    # Collect the unique non-empty cue texts, preserving first-seen order.
+    unique_texts = []
+    seen = {}
+    for line in lines:
+        if line and line.strip() and line not in seen:
+            seen[line] = None
+            unique_texts.append(line)
+
     batches = []
-    for start in range(0, len(lines), batch_size):
-        batches.append((start, lines[start : start + batch_size]))
+    for start in range(0, len(unique_texts), batch_size):
+        batches.append((start, unique_texts[start : start + batch_size]))
 
     results = [None] * len(batches)
+    total_batches = len(batches)
+    done_batches = 0
+    if progress_cb is not None:
+        progress_cb(0, total_batches)
+
+    if _cancelled():
+        raise RuntimeError("Cancelled")
 
     def _work(item):
         start, chunk = item
         return start, translate_batch(client, model, chunk, src, tgt, context, start_index=start)
 
-    with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
-        futures = {pool.submit(_work, item): i for i, item in enumerate(batches)}
-        with tqdm(total=len(batches), desc="Translating", unit="batch") as bar:
-            for fut in as_completed(futures):
-                i = futures[fut]
-                _start, translated = fut.result()
-                results[i] = translated
-                bar.update(1)
+    disable_bar = not (hasattr(sys.stderr, "isatty") and sys.stderr.isatty())
 
-    out = []
+    if total_batches:
+        with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+            futures = {pool.submit(_work, item): i for i, item in enumerate(batches)}
+            with tqdm(total=total_batches, desc="Translating", unit="batch", disable=disable_bar) as bar:
+                for fut in as_completed(futures):
+                    i = futures[fut]
+                    _start, translated = fut.result()
+                    results[i] = translated
+                    bar.update(1)
+                    done_batches += 1
+                    if progress_cb is not None:
+                        progress_cb(done_batches, total_batches)
+                    if _cancelled():
+                        for f in futures:
+                            f.cancel()
+                        raise RuntimeError("Cancelled")
+
+    translated_unique = []
     for part in results:
-        out.extend(part)
-    if len(out) != len(lines):
-        raise RuntimeError(f"internal error: got {len(out)} translations for {len(lines)} cues")
+        translated_unique.extend(part or [])
+    if len(translated_unique) != len(unique_texts):
+        raise RuntimeError(
+            f"internal error: got {len(translated_unique)} translations for {len(unique_texts)} unique cues"
+        )
+
+    mapping = dict(zip(unique_texts, translated_unique))
+    out = []
+    for line in lines:
+        if not line or not line.strip():
+            out.append("")
+        else:
+            out.append(mapping.get(line, line))
     return out
 
 
@@ -400,15 +398,14 @@ def build_dual_and_target(subs: pysubs2.SSAFile, translations, order: str):
     dual = copy.deepcopy(subs)
     target_only = copy.deepcopy(subs)
 
-    for event, translation in zip(dual, translations):
+    for event, translation in zip(dual, translations, strict=True):
         original = event.plaintext
-        # Restore any collapsed multi-line cues from " / " separators if needed.
         if order == "target-top":
             event.plaintext = f"{translation}\n{original}"
         else:
             event.plaintext = f"{original}\n{translation}"
 
-    for event, translation in zip(target_only, translations):
+    for event, translation in zip(target_only, translations, strict=True):
         event.plaintext = translation
 
     return dual, target_only
@@ -634,6 +631,7 @@ def estimate_time_shift(
     step = max(1, len(primary) // 120)
     sample = [(e.start, e.end) for i, e in enumerate(primary) if i % step == 0]
     sec = [(e.start, e.end) for e in secondary]
+    sec.sort(key=lambda x: x[0])
 
     def total_overlap(shift: int) -> int:
         total = 0
@@ -752,17 +750,21 @@ def merge_subs(
 def process_merge(args, path_a: Path, path_b: Path):
     print(f"\n=== merge: {path_a.name} + {path_b.name} ===")
 
-    # Allow video inputs: extract soft tracks first.
-    a = resolve_input(path_a, args) if path_a.suffix.lower() in VIDEO_EXTS else path_a
-    b = resolve_input(path_b, args) if path_b.suffix.lower() in VIDEO_EXTS else path_b
+    a, b = path_a, path_b
     if a.suffix.lower() not in SUPPORTED_EXTS or b.suffix.lower() not in SUPPORTED_EXTS:
-        raise RuntimeError("Both merge inputs must be subtitle files (or videos with soft text tracks).")
+        raise RuntimeError("Both merge inputs must be subtitle files (.srt/.vtt/.ass/.ssa).")
 
     subs_a = load_subs(a)
     subs_b = load_subs(b)
     script_a, script_b = detect_script(subs_a), detect_script(subs_b)
     print(f"  {a.name}: {len(subs_a)} cues ({script_a})")
     print(f"  {b.name}: {len(subs_b)} cues ({script_b})")
+
+    # Manual --shift-ms always targets Subtitle 2 / FILE_2 (subs_b), applied
+    # before spine selection so the semantics are stable regardless of swaps.
+    if args.shift_ms:
+        print(f"  Applying manual shift to {b.name} (Subtitle 2): {args.shift_ms:+d} ms")
+        subs_b = _shift_subs(subs_b, args.shift_ms)
 
     # Prefer Latin (usually English) as the timing spine / "source" line.
     if script_a == "cjk" and script_b == "latin":
@@ -777,14 +779,11 @@ def process_merge(args, path_a: Path, path_b: Path):
         else:
             print("  Using first file as timing spine (could not confidently detect scripts)")
 
-    shift = args.shift_ms
     if args.auto_shift:
         estimated = estimate_time_shift(primary, secondary)
-        shift += estimated
         print(f"  Auto sync offset for second track: {estimated:+d} ms")
-    if shift:
-        print(f"  Applying shift to second track: {shift:+d} ms")
-        secondary = _shift_subs(secondary, shift)
+        if estimated:
+            secondary = _shift_subs(secondary, estimated)
 
     dual = merge_subs(
         primary,
@@ -811,30 +810,28 @@ def process_merge(args, path_a: Path, path_b: Path):
     print(f"  -> {out_path.name}  ({len(dual)} cues, {matched} stacked-source cues, format={fmt}, layout={layout})")
 
 
-def process_file(client, args, path: Path):
+def process_file(client, args, path: Path, cancel_event=None, progress_cb=None) -> bool:
+    """Translate one subtitle file. Returns True on success, False on skip/failure."""
     print(f"\n=== {path.name} ===")
 
-    try:
-        sub_path = resolve_input(path, args)
-    except Exception as e:
-        print(f"  [error] {e}", file=sys.stderr)
-        return
-
-    if args.extract_only:
-        print(f"  -> extracted only: {sub_path.name}")
-        return
-
+    sub_path = path
     if sub_path.suffix.lower() not in SUPPORTED_EXTS:
         print(f"  [skip] unsupported extension: {sub_path.suffix}")
-        return
-
-    if sub_path != path:
-        print(f"  Using extracted subtitle: {sub_path.name}")
+        return False
 
     subs = load_subs(sub_path)
     lines = [event.plaintext for event in subs]
     print(f"  {len(lines)} cues loaded")
     source_lang = resolve_source_lang(subs, args.source_lang)
+
+    if source_lang == args.target_lang:
+        print(
+            f"  [error] source language ({source_lang}) equals target language "
+            f"({args.target_lang}); nothing to translate. Skipping.",
+            file=sys.stderr,
+        )
+        return False
+
     print(f"  batch_size={args.batch_size}, workers={args.workers}")
 
     translations = translate_all(
@@ -846,6 +843,8 @@ def process_file(client, args, path: Path):
         args.context,
         args.batch_size,
         workers=args.workers,
+        cancel_event=cancel_event,
+        progress_cb=progress_cb,
     )
 
     dual_subs, target_subs = build_dual_and_target(subs, translations, args.order)
@@ -864,7 +863,927 @@ def process_file(client, args, path: Path):
 
     print(f"  -> {dual_path.name}")
     print(f"  -> {target_path.name}")
-    print(f"  -> {source_path.name}")
+    if sub_path.resolve() != source_path.resolve():
+        print(f"  -> {source_path.name}")
+    return True
+
+
+
+# --- Desktop UI (Tkinter) -----------------------------------------------------
+
+
+
+
+
+SUB_TYPES = [
+    ("Subtitles", "*.srt *.vtt *.ass *.ssa"),
+    ("All files", "*.*"),
+]
+
+PREVIEW_CUES = 40
+TRANSLATE_PREVIEW_CUES = 8
+
+
+class QueueWriter:
+    """Redirect print() into a thread-safe queue for the log pane."""
+
+    def __init__(self, q: queue.Queue):
+        self.q = q
+
+    def write(self, text: str):
+        if text:
+            self.q.put(text)
+
+    def flush(self):
+        pass
+
+
+def _fmt_ts(ms: int) -> str:
+    h = ms // 3_600_000
+    m = (ms % 3_600_000) // 60_000
+    s = (ms % 60_000) // 1000
+    milli = ms % 1000
+    if h:
+        return f"{h:d}:{m:02d}:{s:02d}.{milli:03d}"
+    return f"{m:02d}:{s:02d}.{milli:03d}"
+
+
+def _format_subs_preview(subs, title: str, limit: int = PREVIEW_CUES) -> str:
+    lines = [f"{title}  —  {len(subs)} cues", "-" * 56]
+    for i, event in enumerate(subs):
+        if i >= limit:
+            lines.append(f"… ({len(subs) - limit} more cues)")
+            break
+        text = (event.plaintext or "").replace("\n", " ↵ ")
+        lines.append(f"{_fmt_ts(event.start)} → {_fmt_ts(event.end)}")
+        lines.append(f"  {text}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+_TkBase = tk.Tk if _HAS_TK else object
+
+
+class DualSubsApp(_TkBase):
+    def __init__(self):
+        super().__init__()
+        self.title("Dual Subtitles")
+        self.geometry("880x740")
+        self.minsize(720, 580)
+
+        self.log_q: queue.Queue = queue.Queue()
+        self.worker: "threading.Thread | None" = None
+        self._preview_job = None
+        self._preview_token = 0
+        self._translate_preview_worker: "threading.Thread | None" = None
+        self._cancel_event = threading.Event()
+        self._build()
+        self.after(100, self._drain_log)
+
+    def _build(self):
+        pad = {"padx": 10, "pady": 6}
+        root = ttk.Frame(self, padding=12)
+        root.pack(fill=tk.BOTH, expand=True)
+
+        # Mode
+        mode_row = ttk.Frame(root)
+        mode_row.pack(fill=tk.X, **pad)
+        ttk.Label(mode_row, text="Mode").pack(side=tk.LEFT)
+        self.mode = tk.StringVar(value="translate")
+        for value, label in (
+            ("translate", "Translate (AI)"),
+            ("merge", "Merge two files"),
+        ):
+            ttk.Radiobutton(
+                mode_row,
+                text=label,
+                value=value,
+                variable=self.mode,
+                command=self._on_mode_change,
+            ).pack(side=tk.LEFT, padx=(12, 0))
+
+        # Files
+        files = ttk.LabelFrame(root, text="Files", padding=10)
+        files.pack(fill=tk.X, **pad)
+
+        self.file_a_var = tk.StringVar()
+        self.file_b_var = tk.StringVar()
+        self.file_a_label = ttk.Label(files, text="Subtitle")
+        self.file_b_label = ttk.Label(files, text="Subtitle 2")
+
+        self.file_a_label.grid(row=0, column=0, sticky=tk.W, pady=4)
+        ttk.Entry(files, textvariable=self.file_a_var).grid(row=0, column=1, sticky=tk.EW, padx=8)
+        ttk.Button(files, text="Browse…", command=lambda: self._browse(self.file_a_var)).grid(row=0, column=2)
+
+        self.file_b_label.grid(row=1, column=0, sticky=tk.W, pady=4)
+        self.file_b_entry = ttk.Entry(files, textvariable=self.file_b_var)
+        self.file_b_entry.grid(row=1, column=1, sticky=tk.EW, padx=8)
+        self.file_b_btn = ttk.Button(files, text="Browse…", command=lambda: self._browse(self.file_b_var))
+        self.file_b_btn.grid(row=1, column=2)
+        files.columnconfigure(1, weight=1)
+
+        self.file_a_var.trace_add("write", lambda *_: self._schedule_preview())
+        self.file_b_var.trace_add("write", lambda *_: self._schedule_preview())
+
+        # Options
+        opts = ttk.LabelFrame(root, text="Options", padding=10)
+        opts.pack(fill=tk.X, **pad)
+
+        ttk.Label(opts, text="Source lang").grid(row=0, column=0, sticky=tk.W, pady=4)
+        self.source_lang = tk.StringVar(value="auto")
+        self.source_lang_box = ttk.Combobox(
+            opts,
+            textvariable=self.source_lang,
+            values=["auto"] + [code for code, _ in TARGET_LANG_CHOICES],
+            width=14,
+        )
+        self.source_lang_box.grid(row=0, column=1, sticky=tk.W, padx=8)
+        self.source_lang_box.bind("<<ComboboxSelected>>", lambda *_: self._schedule_preview())
+        self.source_lang.trace_add("write", lambda *_: self._schedule_preview())
+
+        ttk.Label(opts, text="Target lang").grid(row=0, column=2, sticky=tk.W, padx=(16, 0))
+        self.target_lang = tk.StringVar(value="zh-CN")
+        self.target_lang_labels = {label: code for code, label in TARGET_LANG_CHOICES}
+        self.target_lang_by_code = {code: label for code, label in TARGET_LANG_CHOICES}
+        self.target_lang_box = ttk.Combobox(
+            opts,
+            values=[label for _, label in TARGET_LANG_CHOICES],
+            state="readonly",
+            width=28,
+        )
+        self.target_lang_box.set(self.target_lang_by_code["zh-CN"])
+        self.target_lang_box.grid(row=0, column=3, sticky=tk.W, padx=8)
+        self.target_lang_box.bind("<<ComboboxSelected>>", self._on_target_picked)
+
+        self.source_detect_label = ttk.Label(opts, text="Source: auto-detect when a file is loaded")
+        self.source_detect_label.grid(row=4, column=0, columnspan=4, sticky=tk.W, pady=(4, 0))
+
+        ttk.Label(opts, text="Line order").grid(row=1, column=0, sticky=tk.W, pady=4)
+        self.order = tk.StringVar(value="source-top")
+        order_box = ttk.Combobox(
+            opts,
+            textvariable=self.order,
+            values=["source-top", "target-top"],
+            state="readonly",
+            width=14,
+        )
+        order_box.grid(row=1, column=1, sticky=tk.W, padx=8)
+        order_box.bind("<<ComboboxSelected>>", lambda *_: self._schedule_preview())
+
+        ttk.Label(opts, text="Dual format").grid(row=1, column=2, sticky=tk.W, padx=(16, 0))
+        self.dual_format = tk.StringVar(value="srt")
+        ttk.Combobox(
+            opts,
+            textvariable=self.dual_format,
+            values=["srt", "ass"],
+            state="readonly",
+            width=8,
+        ).grid(row=1, column=3, sticky=tk.W, padx=8)
+
+        ttk.Label(opts, text="Dual layout").grid(row=2, column=0, sticky=tk.W, pady=4)
+        self.dual_layout = tk.StringVar(value="stacked")
+        layout_box = ttk.Combobox(
+            opts,
+            textvariable=self.dual_layout,
+            values=["stacked", "single-line"],
+            state="readonly",
+            width=14,
+        )
+        layout_box.grid(row=2, column=1, sticky=tk.W, padx=8)
+        layout_box.bind("<<ComboboxSelected>>", lambda *_: self._schedule_preview())
+
+        ttk.Label(opts, text="Model").grid(row=2, column=2, sticky=tk.W, padx=(16, 0))
+        self.model = tk.StringVar(value=DEFAULT_MODEL)
+        model_values = list(MODEL_CHOICES)
+        if DEFAULT_MODEL not in model_values:
+            model_values.insert(0, DEFAULT_MODEL)
+        self.model_box = ttk.Combobox(
+            opts,
+            textvariable=self.model,
+            values=model_values,
+            width=28,
+        )
+        self.model_box.grid(row=2, column=3, sticky=tk.W, padx=8)
+
+        ttk.Label(opts, text="Context").grid(row=3, column=0, sticky=tk.NW, pady=4)
+        self.context = tk.Text(opts, height=2, width=50, wrap=tk.WORD)
+        self.context.grid(row=3, column=1, columnspan=3, sticky=tk.EW, padx=8, pady=4)
+        opts.columnconfigure(3, weight=1)
+
+        # Merge sync options (only meaningful in Merge mode).
+        self.sync_frame = ttk.LabelFrame(root, text="Merge sync", padding=10)
+        self.auto_shift = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            self.sync_frame,
+            text="Auto-shift (estimate global sync offset)",
+            variable=self.auto_shift,
+            command=lambda: self._schedule_preview(delay_ms=100),
+        ).grid(row=0, column=0, columnspan=2, sticky=tk.W)
+
+        ttk.Label(self.sync_frame, text="Shift ms (Subtitle 2)").grid(row=1, column=0, sticky=tk.W, pady=4)
+        self.shift_ms = tk.IntVar(value=0)
+        self.shift_spin = ttk.Spinbox(
+            self.sync_frame,
+            from_=-600000,
+            to=600000,
+            increment=100,
+            textvariable=self.shift_ms,
+            width=12,
+            command=lambda: self._schedule_preview(delay_ms=100),
+        )
+        self.shift_spin.grid(row=1, column=1, sticky=tk.W, padx=8)
+        self.shift_ms.trace_add("write", lambda *_: self._schedule_preview(delay_ms=400))
+
+        self.drop_unmatched = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            self.sync_frame,
+            text="Drop unmatched Subtitle 2 cues",
+            variable=self.drop_unmatched,
+            command=lambda: self._schedule_preview(delay_ms=100),
+        ).grid(row=2, column=0, columnspan=2, sticky=tk.W)
+
+        # Actions
+        actions = ttk.Frame(root)
+        self.actions = actions
+        actions.pack(fill=tk.X, **pad)
+        self.run_btn = ttk.Button(actions, text="Run", command=self._run)
+        self.run_btn.pack(side=tk.LEFT)
+        self.cancel_btn = ttk.Button(actions, text="Cancel", command=self._cancel, state=tk.DISABLED)
+        self.cancel_btn.pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(actions, text="Refresh preview", command=self._refresh_preview).pack(side=tk.LEFT, padx=8)
+        ttk.Button(actions, text="Open output folder", command=self._open_folder).pack(side=tk.LEFT, padx=8)
+        self.status = ttk.Label(actions, text="Ready")
+        self.status.pack(side=tk.RIGHT)
+        self.progress = ttk.Progressbar(actions, mode="determinate", length=180)
+        self.progress.pack(side=tk.RIGHT, padx=10)
+
+        # Preview (default) + Log tabs
+        notebook = ttk.Notebook(root)
+        notebook.pack(fill=tk.BOTH, expand=True, **pad)
+
+        preview_frame = ttk.Frame(notebook, padding=6)
+        log_frame = ttk.Frame(notebook, padding=6)
+        notebook.add(preview_frame, text="Preview")
+        notebook.add(log_frame, text="Log")
+        self.notebook = notebook
+
+        self.preview_meta = ttk.Label(preview_frame, text="Load a subtitle file to preview cues and timing.")
+        self.preview_meta.pack(fill=tk.X, pady=(0, 4))
+
+        player_toggle = ttk.Frame(preview_frame)
+        player_toggle.pack(fill=tk.X, pady=(0, 4))
+        self.show_player_preview = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            player_toggle,
+            text="Show video preview",
+            variable=self.show_player_preview,
+            command=self._on_player_preview_toggle,
+        ).pack(side=tk.LEFT)
+        self.live_preview = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            player_toggle,
+            text="Live AI sample preview",
+            variable=self.live_preview,
+            command=lambda: self._schedule_preview(delay_ms=100),
+        ).pack(side=tk.LEFT, padx=(16, 0))
+
+        # Fake player stage — how dual lines would look over video (opt-in).
+        self.player_stage = ttk.LabelFrame(preview_frame, text="Player look", padding=4)
+        self.player_canvas = tk.Canvas(self.player_stage, height=96, bg="#141414", highlightthickness=0)
+        self.player_canvas.pack(fill=tk.X)
+        self.player_canvas.bind("<Configure>", lambda e: self._redraw_player())
+
+        nav = ttk.Frame(self.player_stage)
+        nav.pack(fill=tk.X, pady=(6, 0))
+        ttk.Button(nav, text="◀ Prev cue", command=self._player_prev).pack(side=tk.LEFT)
+        ttk.Button(nav, text="Next cue ▶", command=self._player_next).pack(side=tk.LEFT, padx=6)
+        self.player_cue_label = ttk.Label(nav, text="No cue")
+        self.player_cue_label.pack(side=tk.LEFT, padx=10)
+        self._player_cues: list[tuple[str, str, str]] = []  # (top, bottom, time_label)
+        self._player_index = 0
+
+        list_wrap = ttk.Frame(preview_frame)
+        self._preview_list_wrap = list_wrap
+        list_wrap.pack(fill=tk.BOTH, expand=True)
+        self.preview = tk.Text(list_wrap, wrap=tk.WORD, state=tk.DISABLED, font=("Consolas", 10), height=10)
+        preview_scroll = ttk.Scrollbar(list_wrap, command=self.preview.yview)
+        self.preview.configure(yscrollcommand=preview_scroll.set)
+        self.preview.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        preview_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        self.preview.tag_configure("time", foreground="#555555")
+        self.preview.tag_configure("ok", foreground="#0a7a32")
+        self.preview.tag_configure("warn", foreground="#a15c00")
+        self.preview.tag_configure("miss", foreground="#a10000")
+        self.preview.tag_configure("header", font=("Consolas", 10, "bold"))
+
+        self.log = tk.Text(log_frame, wrap=tk.WORD, state=tk.DISABLED)
+        log_scroll = ttk.Scrollbar(log_frame, command=self.log.yview)
+        self.log.configure(yscrollcommand=log_scroll.set)
+        self.log.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        log_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        self._on_mode_change()
+
+    def _on_mode_change(self):
+        merge = self.mode.get() == "merge"
+        state = tk.NORMAL if merge else tk.DISABLED
+        self.file_b_entry.configure(state=state)
+        self.file_b_btn.configure(state=state)
+        if merge:
+            self.file_a_label.configure(text="Subtitle 1")
+            self.file_b_label.configure(text="Subtitle 2")
+            self.sync_frame.pack(fill=tk.X, padx=10, pady=6, before=self.actions)
+        else:
+            self.file_a_label.configure(text="Subtitle")
+            self.file_b_label.configure(text="Subtitle 2")
+            self.sync_frame.pack_forget()
+        self._schedule_preview()
+
+    def _on_target_picked(self, *_):
+        label = self.target_lang_box.get()
+        code = self.target_lang_labels.get(label)
+        if code:
+            self.target_lang.set(code)
+        # Re-run translate sample preview for the newly chosen target.
+        if self.mode.get() == "translate":
+            self._schedule_preview(delay_ms=400)
+
+    def _resolved_source_lang(self, subs) -> str:
+        selected = (self.source_lang.get() or "auto").strip()
+        if selected.lower() in {"", "auto", "detect"}:
+            return detect_language(subs)
+        return selected
+
+    def _update_source_detect_label(self, code: str | None, auto: bool):
+        if not code:
+            self.source_detect_label.configure(text="Source: auto-detect when a file is loaded")
+            return
+        name = lang_name(code)
+        if auto:
+            self.source_detect_label.configure(text=f"Detected source: {name} ({code})")
+        else:
+            self.source_detect_label.configure(text=f"Source: {name} ({code})")
+
+    def _player_font(self, size: int = 16, bold: bool = False):
+        weight = "bold" if bold else "normal"
+        # Prefer a CJK-capable UI font that is actually installed.
+        preferred = ("Microsoft YaHei UI", "Microsoft YaHei", "Noto Sans SC", "PingFang SC", "Segoe UI", "Arial")
+        try:
+            available = set(tkfont.families())
+        except Exception:
+            available = set()
+        for family in preferred:
+            if family in available:
+                return (family, size, weight)
+        return ("Segoe UI" if "Segoe UI" in available else "Arial", size, weight)
+
+    def _on_player_preview_toggle(self):
+        if self.show_player_preview.get():
+            self.player_stage.pack(fill=tk.X, pady=(0, 6), before=self._preview_list_wrap)
+            self.after_idle(self._redraw_player)
+        else:
+            self.player_stage.pack_forget()
+
+    def _set_player_cues(self, cues: list[tuple[str, str, str]], index: int = 0):
+        """cues: list of (top_line, bottom_line, time_label). bottom may be ''."""
+        self._player_cues = cues or []
+        self._player_index = max(0, min(index, len(self._player_cues) - 1)) if self._player_cues else 0
+        if self.show_player_preview.get():
+            self._redraw_player()
+
+    def _player_prev(self):
+        if not self._player_cues:
+            return
+        self._player_index = (self._player_index - 1) % len(self._player_cues)
+        self._redraw_player()
+
+    def _player_next(self):
+        if not self._player_cues:
+            return
+        self._player_index = (self._player_index + 1) % len(self._player_cues)
+        self._redraw_player()
+
+    def _draw_outlined_text(self, canvas, x, y, text, font, fill="#ffffff"):
+        if not text:
+            return
+        # Soft black outline like a typical video player.
+        for dx, dy in (
+            (-2, 0),
+            (2, 0),
+            (0, -2),
+            (0, 2),
+            (-1, -1),
+            (1, -1),
+            (-1, 1),
+            (1, 1),
+        ):
+            canvas.create_text(x + dx, y + dy, text=text, fill="#000000", font=font, anchor="s")
+        canvas.create_text(x, y, text=text, fill=fill, font=font, anchor="s")
+
+    def _redraw_player(self):
+        if not self.show_player_preview.get():
+            return
+        canvas = self.player_canvas
+        canvas.delete("all")
+        w = max(canvas.winfo_width(), 320)
+        h = max(canvas.winfo_height(), 90)
+
+        # Compact strip — just enough room for the subtitle lines.
+        canvas.create_rectangle(0, 0, w, h, fill="#1a1a1a", outline="")
+        canvas.create_rectangle(4, 4, w - 4, h - 4, fill="#222222", outline="#333333")
+
+        if not self._player_cues:
+            canvas.create_text(
+                w // 2,
+                h // 2,
+                text="Load a file to preview how subs look on screen",
+                fill="#777777",
+                font=("Segoe UI", 10),
+            )
+            self.player_cue_label.configure(text="No cue")
+            return
+
+        top, bottom, time_label = self._player_cues[self._player_index]
+        layout = self.dual_layout.get() or "stacked"
+        self.player_cue_label.configure(
+            text=f"Cue {self._player_index + 1}/{len(self._player_cues)}  ·  {time_label}"
+        )
+
+        cx = w // 2
+        if layout == "single-line":
+            line = f"{top}  |  {bottom}" if bottom else top
+            self._draw_outlined_text(canvas, cx, h - 18, line, self._player_font(13), fill="#ffffff")
+        else:
+            if bottom:
+                self._draw_outlined_text(canvas, cx, h - 40, top, self._player_font(13), fill="#ffffff")
+                self._draw_outlined_text(canvas, cx, h - 16, bottom, self._player_font(13), fill="#ffffff")
+            else:
+                self._draw_outlined_text(canvas, cx, h - 18, top, self._player_font(13), fill="#ffffff")
+
+    def _browse(self, var: tk.StringVar):
+        path = filedialog.askopenfilename(title="Choose file", filetypes=SUB_TYPES)
+        if path:
+            var.set(path)
+
+    def _set_text(self, widget: tk.Text, content: str, tagged_chunks=None):
+        widget.configure(state=tk.NORMAL)
+        widget.delete("1.0", tk.END)
+        if tagged_chunks:
+            for text, tag in tagged_chunks:
+                widget.insert(tk.END, text, tag if tag else ())
+        else:
+            widget.insert(tk.END, content)
+        widget.configure(state=tk.DISABLED)
+
+    def _append_log(self, text: str):
+        self.log.configure(state=tk.NORMAL)
+        self.log.insert(tk.END, text)
+        self.log.see(tk.END)
+        self.log.configure(state=tk.DISABLED)
+
+    def _drain_log(self):
+        try:
+            while True:
+                self._append_log(self.log_q.get_nowait())
+        except queue.Empty:
+            pass
+        self.after(100, self._drain_log)
+
+    def _set_busy(self, busy: bool):
+        self.run_btn.configure(state=tk.DISABLED if busy else tk.NORMAL)
+        self.cancel_btn.configure(state=tk.NORMAL if busy else tk.DISABLED)
+        self.status.configure(text="Working…" if busy else "Ready")
+        self.progress.configure(value=0, maximum=100)
+
+    def _cancel(self):
+        self._cancel_event.set()
+        self.status.configure(text="Cancelling…")
+
+    def _progress_cb(self, done: int, total: int):
+        def apply():
+            self.progress.configure(maximum=max(1, total), value=done)
+            if total:
+                self.status.configure(text=f"Working… {done}/{total} batches")
+
+        self.after(0, apply)
+
+    def _open_folder(self):
+        path = self.file_a_var.get().strip().strip('"') or self.file_b_var.get().strip().strip('"')
+        folder = Path(path).parent if path else Path.cwd()
+        if not folder.exists():
+            messagebox.showinfo("Open folder", "Pick a file first.")
+            return
+        try:
+            if sys.platform.startswith("win"):
+                os.startfile(str(folder))  # noqa: S606 — Windows explorer open
+            elif sys.platform == "darwin":
+                subprocess.run(["open", str(folder)], check=False)
+            else:
+                subprocess.run(["xdg-open", str(folder)], check=False)
+        except Exception as e:
+            messagebox.showerror("Open folder", f"Could not open folder:\n{e}")
+
+    def _schedule_preview(self, delay_ms: int = 250):
+        if self._preview_job is not None:
+            self.after_cancel(self._preview_job)
+        self._preview_job = self.after(delay_ms, self._refresh_preview)
+
+    def _load_sub_preview(self, path: Path):
+        if path.suffix.lower() not in SUPPORTED_EXTS:
+            return None, f"Unsupported file type: {path.suffix}"
+        return load_subs(path), None
+
+    def _refresh_preview(self):
+        self._preview_job = None
+        # Invalidate any in-flight sample-preview worker so stale results are dropped.
+        self._preview_token += 1
+        path_a = self.file_a_var.get().strip().strip('"')
+        path_b = self.file_b_var.get().strip().strip('"')
+        mode = self.mode.get()
+
+        if not path_a:
+            self.preview_meta.configure(text="Load a subtitle file to preview cues and timing.")
+            self._set_text(self.preview, "")
+            self._set_player_cues([])
+            return
+
+        a = Path(path_a)
+        if not a.exists():
+            self.preview_meta.configure(text=f"Not found: {a.name}")
+            self._set_text(self.preview, "")
+            self._set_player_cues([])
+            return
+
+        try:
+            if mode == "merge" and path_b:
+                self._preview_merge(a, Path(path_b))
+            else:
+                self._preview_single(a)
+        except Exception as e:
+            self.preview_meta.configure(text=f"Preview error: {e}")
+            self._set_text(self.preview, str(e))
+
+    def _preview_single(self, path: Path):
+        subs, note = self._load_sub_preview(path)
+        if note:
+            self.preview_meta.configure(text=note)
+            self._set_text(self.preview, note)
+            self._update_source_detect_label(None, False)
+            return
+        script = detect_script(subs)
+        auto = (self.source_lang.get() or "auto").strip().lower() in {"", "auto", "detect"}
+        detected = self._resolved_source_lang(subs)
+        self._update_source_detect_label(detected, auto=auto)
+
+        if self.mode.get() != "translate":
+            self.preview_meta.configure(
+                text=f"{path.name}  ·  {len(subs)} cues  ·  script={script}  ·  lang={detected}"
+            )
+            self._set_text(self.preview, _format_subs_preview(subs, path.name))
+            cues = []
+            for event in list(subs)[:PREVIEW_CUES]:
+                text = (event.plaintext or "").replace("\n", " ")
+                cues.append((text, "", f"{_fmt_ts(event.start)} → {_fmt_ts(event.end)}"))
+            self._set_player_cues(cues, 0)
+            return
+
+        # Translate mode: always show the source cue list. Only call the API for a
+        # live sample when the user opts in (Live AI sample preview checkbox).
+        label = self.target_lang_box.get()
+        if label in self.target_lang_labels:
+            self.target_lang.set(self.target_lang_labels[label])
+        target = self.target_lang.get().strip() or "zh-CN"
+        order = self.order.get() or "source-top"
+
+        source_text = _format_subs_preview(subs, f"SOURCE ({detected})", limit=PREVIEW_CUES)
+        source_cues = []
+        for event in list(subs)[:PREVIEW_CUES]:
+            source_cues.append(
+                ((event.plaintext or "").replace("\n", " "), "", f"{_fmt_ts(event.start)} → {_fmt_ts(event.end)}")
+            )
+
+        if not self.live_preview.get():
+            self.preview_meta.configure(
+                text=f"{path.name}  ·  {len(subs)} cues  ·  {detected} → {target}  ·  (enable 'Live AI sample preview' to sample translations)"
+            )
+            self._set_text(self.preview, source_text)
+            self._set_player_cues(source_cues, 0)
+            return
+
+        self.preview_meta.configure(
+            text=(
+                f"{path.name}  ·  {len(subs)} cues  ·  {detected} → {target}  ·  "
+                f"translating sample preview…"
+            )
+        )
+        self._set_text(
+            self.preview,
+            _format_subs_preview(subs, f"SOURCE ({detected})", limit=TRANSLATE_PREVIEW_CUES)
+            + "\n\n(Waiting for translation sample…)\n",
+        )
+        self._set_player_cues(source_cues, 0)
+
+        if not os.environ.get("NVIDIA_API_KEY"):
+            self.preview_meta.configure(
+                text=f"{path.name}  ·  {detected} → {target}  ·  set NVIDIA_API_KEY in .env for live translate preview"
+            )
+            self._set_text(self.preview, source_text)
+            return
+
+        token = self._preview_token
+        model = self.model.get().strip() or DEFAULT_MODEL
+        sample_events = list(subs)[:TRANSLATE_PREVIEW_CUES]
+        sample_lines = [e.plaintext for e in sample_events]
+        context = self.context.get("1.0", tk.END).strip()
+
+        def work():
+            try:
+                client = get_client()
+                translations = translate_batch(
+                    client,
+                    model,
+                    sample_lines,
+                    detected,
+                    target,
+                    context,
+                    start_index=0,
+                    max_retries=2,
+                )
+                self.after(
+                    0,
+                    lambda t=translations: self._apply_translate_preview(
+                        token, path, sample_events, sample_lines, t, detected, target, order
+                    ),
+                )
+            except Exception as e:
+                err = e
+                self.after(
+                    0,
+                    lambda err=err: self._apply_translate_preview_error(token, path, detected, target, err),
+                )
+
+        self._translate_preview_worker = threading.Thread(target=work, daemon=True)
+        self._translate_preview_worker.start()
+
+    def _apply_translate_preview_error(self, token: int, path: Path, src: str, tgt: str, err: Exception):
+        if token != self._preview_token:
+            return
+        self.preview_meta.configure(text=f"{path.name}  ·  {src} → {tgt}  ·  preview failed: {err}")
+
+    def _apply_translate_preview(
+        self,
+        token: int,
+        path: Path,
+        events,
+        source_lines,
+        translations,
+        src: str,
+        tgt: str,
+        order: str,
+    ):
+        if token != self._preview_token:
+            return
+
+        layout = self.dual_layout.get() or "stacked"
+        self.preview_meta.configure(
+            text=f"{path.name}  ·  sample dual preview  ·  {src} → {tgt}  ·  layout={layout}"
+        )
+
+        player_cues = []
+        chunks = []
+        chunks.append((f"TRANSLATE PREVIEW ({len(translations)} cues → {lang_name(tgt)})\n", "header"))
+        chunks.append(("Player stage above shows how a cue looks. Use Prev/Next to flip samples.\n\n", "time"))
+
+        for event, original, translated in zip(events, source_lines, translations):
+            if order == "target-top":
+                top, bottom = translated, original
+            else:
+                top, bottom = original, translated
+            time_label = f"{_fmt_ts(event.start)} → {_fmt_ts(event.end)}"
+            player_cues.append((top, bottom, time_label))
+            chunks.append((f"{time_label}\n", "time"))
+            if layout == "single-line":
+                chunks.append((f"  {top}  |  {bottom}\n\n", "ok"))
+            else:
+                chunks.append((f"  {top}\n", "ok"))
+                chunks.append((f"  {bottom}\n\n", "ok"))
+
+        chunks.append(("=" * 56 + "\n", "time"))
+        chunks.append(("SOURCE FILE (same sample)\n", "header"))
+        for event, original in zip(events, source_lines):
+            chunks.append((f"{_fmt_ts(event.start)} → {_fmt_ts(event.end)}\n", "time"))
+            chunks.append((f"  {original}\n\n", None))
+
+        self._set_player_cues(player_cues, 0)
+        self._set_text(self.preview, "", tagged_chunks=chunks)
+        self.notebook.select(0)
+
+    def _preview_merge(self, path_a: Path, path_b: Path):
+        if not path_b.exists():
+            self.preview_meta.configure(text=f"Not found: {path_b.name}")
+            self._set_text(self.preview, "")
+            return
+
+        subs_a, note_a = self._load_sub_preview(path_a)
+        if note_a:
+            self.preview_meta.configure(text=note_a)
+            self._set_text(self.preview, note_a)
+            return
+        subs_b, note_b = self._load_sub_preview(path_b)
+        if note_b:
+            self.preview_meta.configure(text=note_b)
+            self._set_text(self.preview, note_b)
+            return
+
+        lang_a, lang_b = detect_language(subs_a), detect_language(subs_b)
+        self._update_source_detect_label(lang_a, auto=True)
+        self.source_detect_label.configure(
+            text=f"Detected: Subtitle 1={lang_name(lang_a)} ({lang_a})  ·  Subtitle 2={lang_name(lang_b)} ({lang_b})"
+        )
+
+        # Manual --shift-ms targets Subtitle 2 (subs_b), applied before spine swap.
+        try:
+            manual_shift = int(self.shift_ms.get())
+        except (tk.TclError, ValueError):
+            manual_shift = 0
+        if manual_shift:
+            subs_b = _shift_subs(subs_b, manual_shift)
+
+        script_a, script_b = detect_script(subs_a), detect_script(subs_b)
+        if script_a == "cjk" and script_b == "latin":
+            primary, secondary = subs_b, subs_a
+            spine_name, other_name = path_b.name, path_a.name
+        else:
+            primary, secondary = subs_a, subs_b
+            spine_name, other_name = path_a.name, path_b.name
+
+        if self.auto_shift.get():
+            estimated = estimate_time_shift(primary, secondary)
+            if estimated:
+                secondary = _shift_subs(secondary, estimated)
+
+        dual = merge_subs(
+            primary,
+            secondary,
+            order=self.order.get() or "source-top",
+            min_overlap_ms=80,
+            include_unmatched=not self.drop_unmatched.get(),
+        )
+        dual_count = sum(1 for e in dual if "\n" in (e.plaintext or ""))
+        single_count = len(dual) - dual_count
+        match_pct = (100.0 * dual_count / len(primary)) if primary else 0.0
+
+        self.preview_meta.configure(
+            text=(
+                f"Combined preview  ·  spine={spine_name} + {other_name}  ·  "
+                f"{dual_count}/{len(primary)} paired ({match_pct:.0f}%)"
+                + (f"  ·  {single_count} unpaired in spine" if single_count else "")
+            )
+        )
+
+        chunks = []
+        chunks.append((f"COMBINED PREVIEW (first {PREVIEW_CUES} cues)\n", "header"))
+        chunks.append(("Player stage above shows how a cue looks. Use Prev/Next to flip samples.\n\n", "time"))
+
+        player_cues = []
+        for i, event in enumerate(dual):
+            if i >= PREVIEW_CUES:
+                chunks.append((f"… ({len(dual) - PREVIEW_CUES} more cues)\n", "time"))
+                break
+            paired = "\n" in (event.plaintext or "")
+            tag = "ok" if paired else "miss"
+            time_label = f"{_fmt_ts(event.start)} → {_fmt_ts(event.end)}"
+            parts = [p for p in (event.plaintext or "").split("\n") if p]
+            if len(parts) >= 2:
+                player_cues.append((parts[0], " ".join(parts[1:]), time_label))
+            elif parts:
+                player_cues.append((parts[0], "", time_label))
+            chunks.append((f"{time_label}\n", "time"))
+            for line in (event.plaintext or "").splitlines() or [""]:
+                chunks.append((f"  {line}\n", tag))
+            chunks.append(("\n", None))
+
+        chunks.append(("\n" + "=" * 56 + "\n", "time"))
+        chunks.append(("SUBTITLE 1 (sample)\n", "header"))
+        chunks.append((_format_subs_preview(subs_a, path_a.name, limit=8) + "\n", None))
+        chunks.append(("SUBTITLE 2 (sample)\n", "header"))
+        chunks.append((_format_subs_preview(subs_b, path_b.name, limit=8) + "\n", None))
+
+        self._set_player_cues(player_cues, 0)
+        self._set_text(self.preview, "", tagged_chunks=chunks)
+        self.notebook.select(0)
+
+    def _make_args(self) -> Namespace:
+        # Keep target_lang in sync with the picker label.
+        label = self.target_lang_box.get()
+        if label in self.target_lang_labels:
+            self.target_lang.set(self.target_lang_labels[label])
+        try:
+            shift_ms = int(self.shift_ms.get())
+        except (tk.TclError, ValueError):
+            shift_ms = 0
+        return Namespace(
+            source_lang=self.source_lang.get().strip() or "auto",
+            target_lang=self.target_lang.get().strip() or "zh-CN",
+            order=self.order.get() or "source-top",
+            model=self.model.get().strip() or DEFAULT_MODEL,
+            batch_size=20,
+            workers=6,
+            context=self.context.get("1.0", tk.END).strip(),
+            merge=None,
+            output=None,
+            shift_ms=shift_ms,
+            auto_shift=bool(self.auto_shift.get()),
+            min_overlap_ms=80,
+            drop_unmatched=bool(self.drop_unmatched.get()),
+            format=self.dual_format.get() or "srt",
+            layout=self.dual_layout.get() or "stacked",
+        )
+
+    def _run(self):
+        if self.worker and self.worker.is_alive():
+            messagebox.showwarning("Busy", "Already running.")
+            return
+
+        mode = self.mode.get()
+        path_a = self.file_a_var.get().strip().strip('"')
+        path_b = self.file_b_var.get().strip().strip('"')
+
+        if not path_a:
+            messagebox.showerror("Missing file", "Choose an input file.")
+            return
+        if mode == "merge" and not path_b:
+            messagebox.showerror("Missing file", "Choose both subtitle files to merge.")
+            return
+        if not Path(path_a).exists():
+            messagebox.showerror("Not found", f"File not found:\n{path_a}")
+            return
+        if mode == "merge" and not Path(path_b).exists():
+            messagebox.showerror("Not found", f"File not found:\n{path_b}")
+            return
+
+        args = self._make_args()
+        self.notebook.select(1)
+        self._append_log(f"\n--- {mode} ---\n")
+        self._cancel_event.clear()
+        self._set_busy(True)
+
+        def work():
+            old_out, old_err = sys.stdout, sys.stderr
+            sys.stdout = sys.stderr = QueueWriter(self.log_q)
+            os.environ["PROMPT_ON_EXIT"] = "0"
+            try:
+                if mode == "merge":
+                    process_merge(args, Path(path_a), Path(path_b))
+                else:
+                    if mode == "translate" and not os.environ.get("NVIDIA_API_KEY"):
+                        raise RuntimeError(
+                            "NVIDIA_API_KEY is not set. Put it in a .env file next to dual_subs.py."
+                        )
+                    client = get_client()
+                    process_file(
+                        client,
+                        args,
+                        Path(path_a),
+                        cancel_event=self._cancel_event,
+                        progress_cb=self._progress_cb,
+                    )
+                print("\nDone.")
+            except Exception as e:
+                print(f"\n[error] {e}\n")
+            finally:
+                sys.stdout, sys.stderr = old_out, old_err
+                self.after(0, lambda: self._set_busy(False))
+
+        self.worker = threading.Thread(target=work, daemon=True)
+        self.worker.start()
+
+
+def run_ui(initial_paths=None):
+    if not _HAS_TK:
+        raise RuntimeError(
+            "The desktop UI requires tkinter, which is not available in this Python install.\n"
+            "Use the CLI instead, e.g.: python dual_subs.py movie.srt"
+        )
+    app = DualSubsApp()
+
+    paths = [Path(p) for p in (initial_paths or []) if p]
+    if paths:
+        app.file_a_var.set(str(paths[0]))
+        # A plausible second subtitle file suggests a merge.
+        if len(paths) > 1 and paths[1].suffix.lower() in SUPPORTED_EXTS:
+            app.mode.set("merge")
+            app._on_mode_change()
+            app.file_b_var.set(str(paths[1]))
+
+    key = os.environ.get("NVIDIA_API_KEY")
+    if not key:
+        app._append_log("Tip: create a .env with NVIDIA_API_KEY=... for Translate mode.\n")
+    else:
+        app._append_log("NVIDIA API key loaded.\n")
+    app.mainloop()
+
 
 
 def parse_args():
@@ -872,20 +1791,20 @@ def parse_args():
     parser.add_argument(
         "paths",
         nargs="*",
-        help="Subtitle file(s) and/or video file(s) with soft subtitle tracks",
+        help="Subtitle file(s) (.srt/.vtt/.ass/.ssa)",
     )
     parser.add_argument(
         "--merge",
         nargs=2,
-        metavar=("FILE_A", "FILE_B"),
-        help="Fuse two existing subtitle (or video soft-track) files into one dual file by time sync",
+        metavar=("FILE_1", "FILE_2"),
+        help="Fuse two existing subtitle files into one dual file by time sync",
     )
     parser.add_argument("-o", "--output", default=None, help="Output path for --merge (default: next to first/spine file)")
     parser.add_argument(
         "--shift-ms",
         type=int,
         default=0,
-        help="With --merge: shift the second track by this many milliseconds (after auto-shift if enabled)",
+        help="With --merge: shift FILE_2 / Subtitle 2 by this many milliseconds (applied before spine selection; auto-shift is applied separately)",
     )
     parser.add_argument(
         "--auto-shift",
@@ -932,15 +1851,9 @@ def parse_args():
     parser.add_argument("--batch-size", type=int, default=20, help="Subtitle lines per API request (default: 20)")
     parser.add_argument("--workers", type=int, default=6, help="Parallel API requests (default: 6)")
     parser.add_argument(
-        "--sub-stream",
-        type=int,
-        default=None,
-        help="Which soft subtitle track to extract from a video (0-based). Default: prefer --source-lang, else first text track",
-    )
-    parser.add_argument(
-        "--extract-only",
+        "--ui",
         action="store_true",
-        help="Only extract soft subs from video(s); do not translate",
+        help="Launch the desktop UI (default when no input paths are given)",
     )
     parser.add_argument(
         "--context",
@@ -967,29 +1880,37 @@ def main():
         print("\nDone.")
         return
 
-    if not args.paths:
-        print(__doc__)
-        raw = input("Drag a subtitle/video file here (or type its path) and press Enter: ").strip().strip('"')
-        if raw:
-            args.paths = [raw]
+    if args.ui or (not args.paths and not args.merge):
+        os.environ["PROMPT_ON_EXIT"] = "0"
+        run_ui(initial_paths=args.paths)
+        return
 
     if not args.paths:
         print("No files given. Exiting.")
         return
 
-    client = None if args.extract_only else get_client()
+    try:
+        client = get_client()
+    except RuntimeError as e:
+        sys.exit(f"ERROR: {e}")
 
+    failures = 0
     for raw_path in args.paths:
         path = Path(raw_path)
         if not path.exists():
             print(f"\n=== {raw_path} ===\n  [error] file not found")
+            failures += 1
             continue
         try:
-            process_file(client, args, path)
+            if not process_file(client, args, path):
+                failures += 1
         except Exception as e:
             print(f"  [error] failed to process {path.name}: {e}", file=sys.stderr)
+            failures += 1
 
     print("\nDone.")
+    if failures:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
