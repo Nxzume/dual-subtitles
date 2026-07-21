@@ -9,6 +9,9 @@ __pycache__/
 .venv/
 venv/
 
+# Local launcher shortcut (paths are machine-specific; recreated by setup.bat)
+*.lnk
+
 # Local media / generated subs (keep the tool, not your movies)
 *.srt
 *.vtt

@@ -76,6 +76,7 @@ On Windows, prefer `Dual Subs UI.bat` after `setup.bat` so the venv is used.
 |---|---|---|
 | **Translate (AI)** | Translate one subtitle file into a dual file | Required |
 | **Merge two files** | Fuse Subtitle 1 + Subtitle 2 by time overlap | Not needed |
+| **Edit** | Full cue editor (text, times, add/delete) → Save / Save as | Not needed |
 
 ### Options
 
@@ -93,12 +94,25 @@ On Windows, prefer `Dual Subs UI.bat` after `setup.bat` so the venv is used.
 - **Shift ms (Subtitle 2)** — manual offset applied to Subtitle 2 before spine selection
 - **Drop unmatched** — omit Subtitle 2 cues that don’t overlap anything
 
+### Edit mode
+
+Load any `.srt` / `.vtt` / `.ass` / `.ssa` and edit cues in place:
+
+- Cue list with start, end, and text
+- Detail panel to change times and multiline text (including dual/stacked lines)
+- **Add cue** / **Delete cue**
+- **Save** (overwrite) or **Save as…**
+- **Reload** from disk (warns if you have unsaved changes)
+
+After a successful Translate or Merge, **Edit result** opens the dual output file in Edit mode so you can fix lines by hand before shipping.
+
 ### Preview & run
 
-- Preview always shows cue text/timings for the loaded file(s).
+- Preview always shows cue text/timings for the loaded file(s) (Translate / Merge).
 - **Live AI sample preview** (off by default) — translates ~8 cues with the selected model so you can check quality before a full run. This is the only preview action that calls the API.
 - **Show video preview** (off by default) — compact on-screen mockup of dual lines; use Prev/Next cue to step through.
-- **Run** starts the job; **Cancel** stops an in-progress translation; the progress bar tracks batches.
+- **Run** starts Translate/Merge; **Cancel** stops an in-progress translation; the progress bar tracks batches.
+- **Edit result** opens the last dual output in the editor.
 - **Open output folder** opens the input file’s folder (Windows / macOS / Linux).
 - Progress details also appear on the **Log** tab.
 

@@ -47,7 +47,14 @@ if not exist "%~dp0.env" (
     echo .env already exists — left unchanged.
 )
 
+REM Shortcut with CC icon (Explorer shows bat icon otherwise)
+powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+  "$dir = '%~dp0'.TrimEnd('\'); $ws = New-Object -ComObject WScript.Shell; $s = $ws.CreateShortcut((Join-Path $dir 'Dual Subs UI.lnk')); $s.TargetPath = Join-Path $dir 'Dual Subs UI.bat'; $s.WorkingDirectory = $dir; $ico = Join-Path $dir 'assets\app.ico'; if (Test-Path $ico) { $s.IconLocation = $ico + ',0' }; $s.Description = 'Dual Subtitles'; $s.Save()"
+if exist "%~dp0Dual Subs UI.lnk" (
+    echo Created "Dual Subs UI.lnk" ^(CC icon^).
+)
+
 echo.
-echo Setup complete. Double-click "Dual Subs UI.bat" to open the app.
+echo Setup complete. Double-click "Dual Subs UI.lnk" or "Dual Subs UI.bat" to open the app.
 pause
 endlocal

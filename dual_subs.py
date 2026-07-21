@@ -808,16 +808,17 @@ def process_merge(args, path_a: Path, path_b: Path):
     out_path = save_dual(dual, out_path, fmt, layout=layout)
     matched = sum(1 for e in dual if "\n" in (e.plaintext or ""))
     print(f"  -> {out_path.name}  ({len(dual)} cues, {matched} stacked-source cues, format={fmt}, layout={layout})")
+    return out_path
 
 
-def process_file(client, args, path: Path, cancel_event=None, progress_cb=None) -> bool:
-    """Translate one subtitle file. Returns True on success, False on skip/failure."""
+def process_file(client, args, path: Path, cancel_event=None, progress_cb=None) -> Path | None:
+    """Translate one subtitle file. Returns dual output path on success, None on skip/failure."""
     print(f"\n=== {path.name} ===")
 
     sub_path = path
     if sub_path.suffix.lower() not in SUPPORTED_EXTS:
         print(f"  [skip] unsupported extension: {sub_path.suffix}")
-        return False
+        return None
 
     subs = load_subs(sub_path)
     lines = [event.plaintext for event in subs]
@@ -830,7 +831,7 @@ def process_file(client, args, path: Path, cancel_event=None, progress_cb=None) 
             f"({args.target_lang}); nothing to translate. Skipping.",
             file=sys.stderr,
         )
-        return False
+        return None
 
     print(f"  batch_size={args.batch_size}, workers={args.workers}")
 
@@ -865,7 +866,7 @@ def process_file(client, args, path: Path, cancel_event=None, progress_cb=None) 
     print(f"  -> {target_path.name}")
     if sub_path.resolve() != source_path.resolve():
         print(f"  -> {source_path.name}")
-    return True
+    return dual_path
 
 
 
@@ -877,6 +878,13 @@ def process_file(client, args, path: Path, cancel_event=None, progress_cb=None) 
 
 SUB_TYPES = [
     ("Subtitles", "*.srt *.vtt *.ass *.ssa"),
+    ("All files", "*.*"),
+]
+
+SAVE_TYPES = [
+    ("SubRip", "*.srt"),
+    ("ASS", "*.ass"),
+    ("WebVTT", "*.vtt"),
     ("All files", "*.*"),
 ]
 
@@ -908,6 +916,42 @@ def _fmt_ts(ms: int) -> str:
     return f"{m:02d}:{s:02d}.{milli:03d}"
 
 
+def _parse_ts(text: str) -> int:
+    """Parse mm:ss.mmm or h:mm:ss.mmm (comma or dot decimals) to milliseconds."""
+    raw = (text or "").strip().replace(",", ".")
+    if not raw:
+        raise ValueError("empty timestamp")
+    parts = raw.split(":")
+    if len(parts) == 2:
+        h = 0
+        m_str, s_str = parts
+    elif len(parts) == 3:
+        h_str, m_str, s_str = parts
+        h = int(h_str)
+    else:
+        raise ValueError(f"bad timestamp: {text!r}")
+    if "." in s_str:
+        sec_str, ms_str = s_str.split(".", 1)
+        milli = int((ms_str + "000")[:3])
+    else:
+        sec_str, milli = s_str, 0
+    return (h * 3600 + int(m_str) * 60 + int(sec_str)) * 1000 + milli
+
+
+def _save_subs_file(subs: pysubs2.SSAFile, path: Path) -> Path:
+    """Write SSAFile using the path extension (.srt/.ass/.ssa/.vtt)."""
+    ext = path.suffix.lower()
+    if ext in {".ass", ".ssa"}:
+        subs.save(str(path), format_="ass")
+    elif ext == ".vtt":
+        subs.save(str(path), format_="vtt")
+    else:
+        if ext != ".srt":
+            path = path.with_suffix(".srt")
+        subs.save(str(path), format_="srt")
+    return path
+
+
 def _format_subs_preview(subs, title: str, limit: int = PREVIEW_CUES) -> str:
     lines = [f"{title}  —  {len(subs)} cues", "-" * 56]
     for i, event in enumerate(subs):
@@ -930,6 +974,7 @@ class DualSubsApp(_TkBase):
         self.title("Dual Subtitles")
         self.geometry("880x740")
         self.minsize(720, 580)
+        self._set_app_icon()
 
         self.log_q: queue.Queue = queue.Queue()
         self.worker: "threading.Thread | None" = None
@@ -937,8 +982,34 @@ class DualSubsApp(_TkBase):
         self._preview_token = 0
         self._translate_preview_worker: "threading.Thread | None" = None
         self._cancel_event = threading.Event()
+        self._edit_subs: pysubs2.SSAFile | None = None
+        self._edit_path: Path | None = None
+        self._edit_dirty = False
+        self._edit_loading = False
+        self._edit_selected_index: int | None = None
+        self._last_output_path: Path | None = None
         self._build()
         self.after(100, self._drain_log)
+
+    def _set_app_icon(self):
+        """Window / taskbar icon (CC caption badge in assets/)."""
+        base = Path(__file__).resolve().parent / "assets"
+        ico = base / "app.ico"
+        png = base / "app.png"
+        try:
+            if ico.is_file():
+                self.iconbitmap(default=str(ico))
+        except tk.TclError:
+            pass
+        try:
+            if png.is_file():
+                self._app_icon = tk.PhotoImage(file=str(png))
+                self.iconphoto(True, self._app_icon)
+            elif ico.is_file():
+                # Fallback if PNG missing but ICO exists (Windows).
+                self.iconbitmap(str(ico))
+        except tk.TclError:
+            pass
 
     def _build(self):
         pad = {"padx": 10, "pady": 6}
@@ -953,6 +1024,7 @@ class DualSubsApp(_TkBase):
         for value, label in (
             ("translate", "Translate (AI)"),
             ("merge", "Merge two files"),
+            ("edit", "Edit"),
         ):
             ttk.Radiobutton(
                 mode_row,
@@ -985,8 +1057,9 @@ class DualSubsApp(_TkBase):
         self.file_a_var.trace_add("write", lambda *_: self._schedule_preview())
         self.file_b_var.trace_add("write", lambda *_: self._schedule_preview())
 
-        # Options
+        # Options (hidden in Edit mode)
         opts = ttk.LabelFrame(root, text="Options", padding=10)
+        self.opts_frame = opts
         opts.pack(fill=tk.X, **pad)
 
         ttk.Label(opts, text="Source lang").grid(row=0, column=0, sticky=tk.W, pady=4)
@@ -1110,6 +1183,10 @@ class DualSubsApp(_TkBase):
         self.run_btn.pack(side=tk.LEFT)
         self.cancel_btn = ttk.Button(actions, text="Cancel", command=self._cancel, state=tk.DISABLED)
         self.cancel_btn.pack(side=tk.LEFT, padx=(8, 0))
+        self.edit_result_btn = ttk.Button(
+            actions, text="Edit result", command=self._open_last_result, state=tk.DISABLED
+        )
+        self.edit_result_btn.pack(side=tk.LEFT, padx=(8, 0))
         ttk.Button(actions, text="Refresh preview", command=self._refresh_preview).pack(side=tk.LEFT, padx=8)
         ttk.Button(actions, text="Open output folder", command=self._open_folder).pack(side=tk.LEFT, padx=8)
         self.status = ttk.Label(actions, text="Ready")
@@ -1140,12 +1217,13 @@ class DualSubsApp(_TkBase):
             command=self._on_player_preview_toggle,
         ).pack(side=tk.LEFT)
         self.live_preview = tk.BooleanVar(value=False)
-        ttk.Checkbutton(
+        self.live_preview_cb = ttk.Checkbutton(
             player_toggle,
             text="Live AI sample preview",
             variable=self.live_preview,
             command=lambda: self._schedule_preview(delay_ms=100),
-        ).pack(side=tk.LEFT, padx=(16, 0))
+        )
+        self.live_preview_cb.pack(side=tk.LEFT, padx=(16, 0))
 
         # Fake player stage — how dual lines would look over video (opt-in).
         self.player_stage = ttk.LabelFrame(preview_frame, text="Player look", padding=4)
@@ -1177,6 +1255,61 @@ class DualSubsApp(_TkBase):
         self.preview.tag_configure("miss", foreground="#a10000")
         self.preview.tag_configure("header", font=("Consolas", 10, "bold"))
 
+        # Cue editor (Edit mode) — shown instead of the preview text list.
+        editor_wrap = ttk.Frame(preview_frame)
+        self._editor_wrap = editor_wrap
+
+        edit_btns = ttk.Frame(editor_wrap)
+        edit_btns.pack(fill=tk.X, pady=(0, 6))
+        ttk.Button(edit_btns, text="Add cue", command=self._edit_add_cue).pack(side=tk.LEFT)
+        ttk.Button(edit_btns, text="Delete cue", command=self._edit_delete_cue).pack(side=tk.LEFT, padx=6)
+        ttk.Button(edit_btns, text="Save", command=self._edit_save).pack(side=tk.LEFT, padx=6)
+        ttk.Button(edit_btns, text="Save as…", command=self._edit_save_as).pack(side=tk.LEFT, padx=6)
+        ttk.Button(edit_btns, text="Reload", command=self._edit_reload).pack(side=tk.LEFT, padx=6)
+
+        panes = ttk.Panedwindow(editor_wrap, orient=tk.HORIZONTAL)
+        panes.pack(fill=tk.BOTH, expand=True)
+
+        tree_frame = ttk.Frame(panes)
+        detail_frame = ttk.LabelFrame(panes, text="Cue", padding=8)
+        panes.add(tree_frame, weight=3)
+        panes.add(detail_frame, weight=2)
+
+        cols = ("num", "start", "end", "text")
+        self.edit_tree = ttk.Treeview(tree_frame, columns=cols, show="headings", selectmode="browse")
+        self.edit_tree.heading("num", text="#")
+        self.edit_tree.heading("start", text="Start")
+        self.edit_tree.heading("end", text="End")
+        self.edit_tree.heading("text", text="Text")
+        self.edit_tree.column("num", width=48, stretch=False, anchor=tk.E)
+        self.edit_tree.column("start", width=100, stretch=False)
+        self.edit_tree.column("end", width=100, stretch=False)
+        self.edit_tree.column("text", width=360, stretch=True)
+        tree_scroll = ttk.Scrollbar(tree_frame, command=self.edit_tree.yview)
+        self.edit_tree.configure(yscrollcommand=tree_scroll.set)
+        self.edit_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        tree_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.edit_tree.bind("<<TreeviewSelect>>", self._on_edit_select)
+
+        ttk.Label(detail_frame, text="Start").grid(row=0, column=0, sticky=tk.W, pady=2)
+        self.edit_start = tk.StringVar()
+        ttk.Entry(detail_frame, textvariable=self.edit_start, width=16).grid(
+            row=0, column=1, sticky=tk.W, padx=6, pady=2
+        )
+        ttk.Label(detail_frame, text="End").grid(row=1, column=0, sticky=tk.W, pady=2)
+        self.edit_end = tk.StringVar()
+        ttk.Entry(detail_frame, textvariable=self.edit_end, width=16).grid(
+            row=1, column=1, sticky=tk.W, padx=6, pady=2
+        )
+        ttk.Label(detail_frame, text="Text").grid(row=2, column=0, sticky=tk.NW, pady=2)
+        self.edit_text = tk.Text(detail_frame, wrap=tk.WORD, height=10, width=36, font=("Consolas", 10))
+        self.edit_text.grid(row=2, column=1, sticky=tk.NSEW, padx=6, pady=2)
+        detail_frame.columnconfigure(1, weight=1)
+        detail_frame.rowconfigure(2, weight=1)
+        ttk.Button(detail_frame, text="Apply to cue", command=self._edit_apply_detail).grid(
+            row=3, column=1, sticky=tk.E, padx=6, pady=(8, 0)
+        )
+
         self.log = tk.Text(log_frame, wrap=tk.WORD, state=tk.DISABLED)
         log_scroll = ttk.Scrollbar(log_frame, command=self.log.yview)
         self.log.configure(yscrollcommand=log_scroll.set)
@@ -1186,10 +1319,21 @@ class DualSubsApp(_TkBase):
         self._on_mode_change()
 
     def _on_mode_change(self):
-        merge = self.mode.get() == "merge"
+        mode = self.mode.get()
+        merge = mode == "merge"
+        edit = mode == "edit"
+
+        # Leaving Edit with unsaved changes — offer to stay.
+        if not edit and getattr(self, "_edit_dirty", False):
+            if not self._confirm_discard_edits():
+                self.mode.set("edit")
+                return
+            self._edit_dirty = False
+
         state = tk.NORMAL if merge else tk.DISABLED
         self.file_b_entry.configure(state=state)
         self.file_b_btn.configure(state=state)
+
         if merge:
             self.file_a_label.configure(text="Subtitle 1")
             self.file_b_label.configure(text="Subtitle 2")
@@ -1198,7 +1342,38 @@ class DualSubsApp(_TkBase):
             self.file_a_label.configure(text="Subtitle")
             self.file_b_label.configure(text="Subtitle 2")
             self.sync_frame.pack_forget()
+
+        if edit:
+            self.opts_frame.pack_forget()
+            self.live_preview_cb.pack_forget()
+            self.run_btn.configure(state=tk.DISABLED)
+            self._preview_list_wrap.pack_forget()
+            self._editor_wrap.pack(fill=tk.BOTH, expand=True)
+            if self.show_player_preview.get():
+                self.player_stage.pack(fill=tk.X, pady=(0, 6), before=self._editor_wrap)
+        else:
+            if not self.opts_frame.winfo_ismapped():
+                self.opts_frame.pack(fill=tk.X, padx=10, pady=6, before=self.actions)
+            if merge:
+                self.sync_frame.pack(fill=tk.X, padx=10, pady=6, before=self.actions)
+            if not self.live_preview_cb.winfo_ismapped():
+                self.live_preview_cb.pack(side=tk.LEFT, padx=(16, 0))
+            if not (self.worker and self.worker.is_alive()):
+                self.run_btn.configure(state=tk.NORMAL)
+            self._editor_wrap.pack_forget()
+            self._preview_list_wrap.pack(fill=tk.BOTH, expand=True)
+            if self.show_player_preview.get():
+                self.player_stage.pack(fill=tk.X, pady=(0, 6), before=self._preview_list_wrap)
+
         self._schedule_preview()
+
+    def _on_player_preview_toggle(self):
+        before = self._editor_wrap if self.mode.get() == "edit" else self._preview_list_wrap
+        if self.show_player_preview.get():
+            self.player_stage.pack(fill=tk.X, pady=(0, 6), before=before)
+            self.after_idle(self._redraw_player)
+        else:
+            self.player_stage.pack_forget()
 
     def _on_target_picked(self, *_):
         label = self.target_lang_box.get()
@@ -1237,13 +1412,6 @@ class DualSubsApp(_TkBase):
             if family in available:
                 return (family, size, weight)
         return ("Segoe UI" if "Segoe UI" in available else "Arial", size, weight)
-
-    def _on_player_preview_toggle(self):
-        if self.show_player_preview.get():
-            self.player_stage.pack(fill=tk.X, pady=(0, 6), before=self._preview_list_wrap)
-            self.after_idle(self._redraw_player)
-        else:
-            self.player_stage.pack_forget()
 
     def _set_player_cues(self, cues: list[tuple[str, str, str]], index: int = 0):
         """cues: list of (top_line, bottom_line, time_label). bottom may be ''."""
@@ -1351,7 +1519,12 @@ class DualSubsApp(_TkBase):
         self.after(100, self._drain_log)
 
     def _set_busy(self, busy: bool):
-        self.run_btn.configure(state=tk.DISABLED if busy else tk.NORMAL)
+        if busy:
+            self.run_btn.configure(state=tk.DISABLED)
+        elif self.mode.get() != "edit":
+            self.run_btn.configure(state=tk.NORMAL)
+        else:
+            self.run_btn.configure(state=tk.DISABLED)
         self.cancel_btn.configure(state=tk.NORMAL if busy else tk.DISABLED)
         self.status.configure(text="Working…" if busy else "Ready")
         self.progress.configure(value=0, maximum=100)
@@ -1402,6 +1575,10 @@ class DualSubsApp(_TkBase):
         path_b = self.file_b_var.get().strip().strip('"')
         mode = self.mode.get()
 
+        if mode == "edit":
+            self._refresh_editor(path_a)
+            return
+
         if not path_a:
             self.preview_meta.configure(text="Load a subtitle file to preview cues and timing.")
             self._set_text(self.preview, "")
@@ -1423,6 +1600,314 @@ class DualSubsApp(_TkBase):
         except Exception as e:
             self.preview_meta.configure(text=f"Preview error: {e}")
             self._set_text(self.preview, str(e))
+
+    def _confirm_discard_edits(self) -> bool:
+        if not self._edit_dirty:
+            return True
+        return messagebox.askyesno(
+            "Unsaved changes",
+            "You have unsaved edits. Discard them?",
+        )
+
+    def _mark_edit_dirty(self, dirty: bool = True):
+        self._edit_dirty = dirty
+        path = self._edit_path.name if self._edit_path else "(unsaved)"
+        n = len(self._edit_subs) if self._edit_subs is not None else 0
+        star = " *" if dirty else ""
+        self.preview_meta.configure(text=f"Edit  ·  {path}{star}  ·  {n} cues")
+
+    def _refresh_editor(self, path_str: str):
+        if not path_str:
+            if self._edit_dirty and not self._confirm_discard_edits():
+                return
+            self._edit_clear()
+            self.preview_meta.configure(text="Load a subtitle file to edit cues.")
+            return
+
+        path = Path(path_str)
+        if not path.exists():
+            self.preview_meta.configure(text=f"Not found: {path.name}")
+            return
+
+        same = self._edit_path is not None and path.resolve() == self._edit_path.resolve()
+        # Already editing this file — keep selection and in-memory edits.
+        # (A scheduled preview refresh must not reload and jump back to cue 1.)
+        if same and self._edit_subs is not None:
+            self._mark_edit_dirty(self._edit_dirty)
+            self._edit_sync_player(index=self._edit_selected_index)
+            return
+
+        if self._edit_subs is not None and self._edit_dirty and not self._confirm_discard_edits():
+            # Revert the path field to the open file.
+            if self._edit_path is not None:
+                self.file_a_var.set(str(self._edit_path))
+            return
+
+        try:
+            subs = load_subs(path)
+        except Exception as e:
+            self.preview_meta.configure(text=f"Load error: {e}")
+            return
+
+        self._edit_load(subs, path)
+
+    def _edit_clear(self):
+        self._edit_apply_detail(silent=True)
+        self._edit_subs = None
+        self._edit_path = None
+        self._edit_dirty = False
+        self._edit_selected_index = None
+        self._edit_loading = True
+        try:
+            for item in self.edit_tree.get_children():
+                self.edit_tree.delete(item)
+            self.edit_start.set("")
+            self.edit_end.set("")
+            self.edit_text.delete("1.0", tk.END)
+        finally:
+            self._edit_loading = False
+        self._set_player_cues([])
+
+    def _edit_load(self, subs: pysubs2.SSAFile, path: Path | None):
+        self._edit_subs = subs
+        self._edit_path = path
+        self._edit_dirty = False
+        self._edit_selected_index = None
+        self._edit_rebuild_tree(select_index=0 if subs else None)
+        self._mark_edit_dirty(False)
+        # Avoid re-triggering the file-path trace (which schedules another refresh).
+        if path is not None:
+            current = self.file_a_var.get().strip().strip('"')
+            try:
+                already = current and Path(current).resolve() == path.resolve()
+            except OSError:
+                already = current == str(path)
+            if not already:
+                self.file_a_var.set(str(path))
+
+    def _edit_rebuild_tree(self, select_index: int | None = None):
+        self._edit_loading = True
+        try:
+            for item in self.edit_tree.get_children():
+                self.edit_tree.delete(item)
+            if self._edit_subs is None:
+                return
+            for i, event in enumerate(self._edit_subs):
+                text = (event.plaintext or "").replace("\n", " ↵ ")
+                if len(text) > 80:
+                    text = text[:77] + "…"
+                self.edit_tree.insert(
+                    "",
+                    tk.END,
+                    iid=str(i),
+                    values=(i + 1, _fmt_ts(event.start), _fmt_ts(event.end), text),
+                )
+            if select_index is not None and self._edit_subs:
+                idx = max(0, min(select_index, len(self._edit_subs) - 1))
+                self.edit_tree.selection_set(str(idx))
+                self.edit_tree.see(str(idx))
+                self._edit_fill_detail(idx)
+            else:
+                self.edit_start.set("")
+                self.edit_end.set("")
+                self.edit_text.delete("1.0", tk.END)
+                self._edit_selected_index = None
+        finally:
+            self._edit_loading = False
+        self._edit_sync_player()
+
+    def _edit_fill_detail(self, index: int):
+        if self._edit_subs is None or index < 0 or index >= len(self._edit_subs):
+            return
+        event = self._edit_subs[index]
+        self._edit_loading = True
+        try:
+            self._edit_selected_index = index
+            self.edit_start.set(_fmt_ts(event.start))
+            self.edit_end.set(_fmt_ts(event.end))
+            self.edit_text.delete("1.0", tk.END)
+            self.edit_text.insert("1.0", event.plaintext or "")
+        finally:
+            self._edit_loading = False
+
+    def _on_edit_select(self, *_):
+        if self._edit_loading or self._edit_subs is None:
+            return
+        sel = self.edit_tree.selection()
+        if not sel:
+            return
+        new_index = int(sel[0])
+        if self._edit_selected_index is not None and self._edit_selected_index != new_index:
+            if not self._edit_apply_detail(silent=False):
+                # Re-select previous if apply failed.
+                self._edit_loading = True
+                try:
+                    self.edit_tree.selection_set(str(self._edit_selected_index))
+                finally:
+                    self._edit_loading = False
+                return
+        self._edit_fill_detail(new_index)
+        self._edit_sync_player(index=new_index)
+
+    def _edit_apply_detail(self, silent: bool = False) -> bool:
+        if self._edit_loading or self._edit_subs is None or self._edit_selected_index is None:
+            return True
+        idx = self._edit_selected_index
+        if idx < 0 or idx >= len(self._edit_subs):
+            return True
+        try:
+            start = _parse_ts(self.edit_start.get())
+            end = _parse_ts(self.edit_end.get())
+        except ValueError as e:
+            if not silent:
+                messagebox.showerror("Invalid time", f"Could not parse start/end:\n{e}")
+            return False
+        if end < start:
+            if not silent:
+                messagebox.showerror("Invalid time", "End must be at or after start.")
+            return False
+        text = self.edit_text.get("1.0", tk.END).rstrip("\n")
+        event = self._edit_subs[idx]
+        changed = event.start != start or event.end != end or (event.plaintext or "") != text
+        event.start = start
+        event.end = end
+        event.plaintext = text
+        if changed:
+            self._mark_edit_dirty(True)
+            preview = text.replace("\n", " ↵ ")
+            if len(preview) > 80:
+                preview = preview[:77] + "…"
+            self.edit_tree.item(str(idx), values=(idx + 1, _fmt_ts(start), _fmt_ts(end), preview))
+            self._edit_sync_player(index=idx)
+        return True
+
+    def _edit_sync_player(self, index: int | None = None):
+        if self._edit_subs is None:
+            self._set_player_cues([])
+            return
+        cues = []
+        for event in self._edit_subs:
+            parts = [p for p in (event.plaintext or "").split("\n") if p]
+            time_label = f"{_fmt_ts(event.start)} → {_fmt_ts(event.end)}"
+            if len(parts) >= 2:
+                cues.append((parts[0], " ".join(parts[1:]), time_label))
+            elif parts:
+                cues.append((parts[0], "", time_label))
+            else:
+                cues.append(("", "", time_label))
+        if index is None:
+            index = self._edit_selected_index or 0
+        self._set_player_cues(cues, index)
+
+    def _edit_add_cue(self):
+        if self._edit_subs is None:
+            self._edit_subs = pysubs2.SSAFile()
+            self._edit_path = None
+        if not self._edit_apply_detail(silent=False):
+            return
+        after = self._edit_selected_index
+        if after is None or after >= len(self._edit_subs) - 1:
+            start = self._edit_subs[-1].end if self._edit_subs else 0
+            insert_at = len(self._edit_subs)
+        else:
+            start = self._edit_subs[after].end
+            insert_at = after + 1
+        event = pysubs2.SSAEvent(start=start, end=start + 2000, text="")
+        self._edit_subs.insert(insert_at, event)
+        self._mark_edit_dirty(True)
+        self._edit_rebuild_tree(select_index=insert_at)
+
+    def _edit_delete_cue(self):
+        if self._edit_subs is None or not self._edit_subs:
+            return
+        sel = self.edit_tree.selection()
+        if not sel:
+            messagebox.showinfo("Delete cue", "Select a cue to delete.")
+            return
+        idx = int(sel[0])
+        del self._edit_subs[idx]
+        self._mark_edit_dirty(True)
+        if not self._edit_subs:
+            self._edit_rebuild_tree(select_index=None)
+            self.edit_start.set("")
+            self.edit_end.set("")
+            self.edit_text.delete("1.0", tk.END)
+            self._edit_selected_index = None
+            return
+        self._edit_rebuild_tree(select_index=min(idx, len(self._edit_subs) - 1))
+
+    def _edit_save(self):
+        if self._edit_subs is None:
+            messagebox.showinfo("Save", "Nothing to save.")
+            return
+        if not self._edit_apply_detail(silent=False):
+            return
+        if self._edit_path is None:
+            self._edit_save_as()
+            return
+        try:
+            self._edit_path = _save_subs_file(self._edit_subs, self._edit_path)
+            self._mark_edit_dirty(False)
+            self._append_log(f"Saved {self._edit_path}\n")
+            self.status.configure(text=f"Saved {self._edit_path.name}")
+        except Exception as e:
+            messagebox.showerror("Save failed", str(e))
+
+    def _edit_save_as(self):
+        if self._edit_subs is None:
+            messagebox.showinfo("Save as", "Nothing to save.")
+            return
+        if not self._edit_apply_detail(silent=False):
+            return
+        initial = self._edit_path.name if self._edit_path else "edited.srt"
+        path = filedialog.asksaveasfilename(
+            title="Save subtitle as",
+            defaultextension=".srt",
+            initialfile=initial,
+            filetypes=SAVE_TYPES,
+        )
+        if not path:
+            return
+        try:
+            out = _save_subs_file(self._edit_subs, Path(path))
+            self._edit_path = out
+            self.file_a_var.set(str(out))
+            self._mark_edit_dirty(False)
+            self._append_log(f"Saved {out}\n")
+            self.status.configure(text=f"Saved {out.name}")
+        except Exception as e:
+            messagebox.showerror("Save failed", str(e))
+
+    def _edit_reload(self):
+        if self._edit_path is None:
+            messagebox.showinfo("Reload", "No file path to reload from. Use Save as… first.")
+            return
+        if self._edit_dirty and not self._confirm_discard_edits():
+            return
+        try:
+            subs = load_subs(self._edit_path)
+        except Exception as e:
+            messagebox.showerror("Reload failed", str(e))
+            return
+        self._edit_load(subs, self._edit_path)
+
+    def _open_last_result(self):
+        if self._last_output_path is None or not self._last_output_path.exists():
+            messagebox.showinfo("Edit result", "No dual output available yet. Run Translate or Merge first.")
+            return
+        if self.mode.get() == "edit" and self._edit_dirty and not self._confirm_discard_edits():
+            return
+        self.mode.set("edit")
+        self._edit_dirty = False
+        self._on_mode_change()
+        self.file_a_var.set(str(self._last_output_path))
+        self.notebook.select(0)
+        self._refresh_editor(str(self._last_output_path))
+
+    def _set_last_output(self, path: Path | None):
+        self._last_output_path = path
+        state = tk.NORMAL if path and path.exists() else tk.DISABLED
+        self.edit_result_btn.configure(state=state)
 
     def _preview_single(self, path: Path):
         subs, note = self._load_sub_preview(path)
@@ -1707,6 +2192,10 @@ class DualSubsApp(_TkBase):
             return
 
         mode = self.mode.get()
+        if mode == "edit":
+            messagebox.showinfo("Edit mode", "Use Save or Save as… to write your edits.")
+            return
+
         path_a = self.file_a_var.get().strip().strip('"')
         path_b = self.file_b_var.get().strip().strip('"')
 
@@ -1733,16 +2222,17 @@ class DualSubsApp(_TkBase):
             old_out, old_err = sys.stdout, sys.stderr
             sys.stdout = sys.stderr = QueueWriter(self.log_q)
             os.environ["PROMPT_ON_EXIT"] = "0"
+            out_path = None
             try:
                 if mode == "merge":
-                    process_merge(args, Path(path_a), Path(path_b))
+                    out_path = process_merge(args, Path(path_a), Path(path_b))
                 else:
                     if mode == "translate" and not os.environ.get("NVIDIA_API_KEY"):
                         raise RuntimeError(
                             "NVIDIA_API_KEY is not set. Put it in a .env file next to dual_subs.py."
                         )
                     client = get_client()
-                    process_file(
+                    out_path = process_file(
                         client,
                         args,
                         Path(path_a),
@@ -1752,9 +2242,17 @@ class DualSubsApp(_TkBase):
                 print("\nDone.")
             except Exception as e:
                 print(f"\n[error] {e}\n")
+                out_path = None
             finally:
                 sys.stdout, sys.stderr = old_out, old_err
-                self.after(0, lambda: self._set_busy(False))
+
+                def finish(p=out_path):
+                    self._set_busy(False)
+                    if p is not None:
+                        self._set_last_output(Path(p))
+                        self._append_log(f"Tip: click Edit result to open {Path(p).name} in the editor.\n")
+
+                self.after(0, finish)
 
         self.worker = threading.Thread(target=work, daemon=True)
         self.worker.start()
@@ -1902,7 +2400,7 @@ def main():
             failures += 1
             continue
         try:
-            if not process_file(client, args, path):
+            if process_file(client, args, path) is None:
                 failures += 1
         except Exception as e:
             print(f"  [error] failed to process {path.name}: {e}", file=sys.stderr)

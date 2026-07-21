@@ -34,6 +34,16 @@ class ParseNumberedTests(unittest.TestCase):
         self.assertEqual(out, ["Alpha\nbeta", "Gamma"])
 
 
+class TimestampTests(unittest.TestCase):
+    def test_parse_fmt_roundtrip_minutes(self):
+        ms = ds._parse_ts("01:02.500")
+        self.assertEqual(ms, 62500)
+        self.assertEqual(ds._fmt_ts(ms), "01:02.500")
+
+    def test_parse_hours_and_comma(self):
+        self.assertEqual(ds._parse_ts("1:02:03,004"), 3723004)
+
+
 class LineReTests(unittest.TestCase):
     def test_matches_large_index(self):
         m = ds.LINE_RE.match("10000|some text")
