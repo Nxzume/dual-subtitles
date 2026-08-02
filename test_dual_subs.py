@@ -95,6 +95,62 @@ class ShiftAndMergeOrderTests(unittest.TestCase):
         self.assertIn("Hello", merged[0].plaintext)
         self.assertIn("\u4f60\u597d", merged[0].plaintext)
 
+    def test_missing_out_tracks_unpaired_primary(self):
+        primary = _make_subs([(0, 1000, "Hello"), (2000, 3000, "Alone")])
+        secondary = _make_subs([(0, 1000, "\u4f60\u597d")])
+        missing = []
+        merged = ds.merge_subs(
+            primary, secondary, order="source-top", min_overlap_ms=80, missing_out=missing
+        )
+        self.assertEqual(len(merged), 2)
+        self.assertIn("\n", merged[0].plaintext)
+        self.assertNotIn("\n", merged[1].plaintext)
+        self.assertEqual(missing, [(1, "primary")])
+
+    def test_stack_filled_pair_orders(self):
+        self.assertEqual(
+            ds._stack_filled_pair("Hello", "你好", True, "source-top"),
+            "Hello\n你好",
+        )
+        self.assertEqual(
+            ds._stack_filled_pair("Hello", "你好", True, "target-top"),
+            "你好\nHello",
+        )
+        self.assertEqual(
+            ds._stack_filled_pair("你好", "Hello", False, "source-top"),
+            "Hello\n你好",
+        )
+
+
+class FillMissingTests(unittest.TestCase):
+    def test_fill_missing_cues_uses_translate_all(self):
+        dual = _make_subs([(0, 1000, "Hello\n你好"), (2000, 3000, "Alone")])
+        missing = [(1, "primary")]
+        calls = []
+
+        def fake_translate_all(client, model, lines, src, tgt, context, batch_size, workers=6, cancel_event=None, progress_cb=None):
+            calls.append((list(lines), src, tgt))
+            return [f"译:{line}" for line in lines]
+
+        orig = ds.translate_all
+        ds.translate_all = fake_translate_all
+        try:
+            out = ds.fill_missing_cues(
+                dual,
+                missing,
+                client=None,
+                primary_lang="en",
+                secondary_lang="zh-CN",
+                order="source-top",
+            )
+        finally:
+            ds.translate_all = orig
+
+        self.assertEqual(calls, [(["Alone"], "en", "zh-CN")])
+        self.assertEqual(out[1].plaintext, "Alone\n译:Alone")
+        # Paired cue untouched.
+        self.assertEqual(out[0].plaintext, "Hello\n你好")
+
 
 class TranslateAllTests(unittest.TestCase):
     def test_empty_cues_pass_through_and_dedupe(self):

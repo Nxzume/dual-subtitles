@@ -18,6 +18,7 @@ For each input "movie.srt" this produces, next to the original file:
     movie.zh-CN.srt  - translation only, in the target language
 
 With --merge, only a dual file is written (timings synced by overlap).
+Optional --fill-missing translates unpaired cues so both languages are present.
 """
 
 from __future__ import annotations
@@ -74,18 +75,84 @@ for _stream in (sys.stdout, sys.stderr):
             pass
 
 SUPPORTED_EXTS = {".srt", ".vtt", ".ass", ".ssa"}
-DEFAULT_MODEL = os.environ.get("NVIDIA_MODEL", "qwen/qwen2.5-72b-instruct")
+# Purpose-built NMT on NIM; many free-tier catalogs no longer serve Qwen (404).
+DEFAULT_MODEL = os.environ.get("NVIDIA_MODEL", "nvidia/riva-translate-4b-instruct-v2")
 DEFAULT_BASE_URL = os.environ.get("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1")
 
 # Model ids offered in the UI picker. The env var NVIDIA_MODEL / --model still
-# overrides. The former default (qwen3.5-397b-a17b) is kept for continuity.
+# overrides. Older Qwen ids remain listed but often 404 on current free-tier keys.
 MODEL_CHOICES = [
-    "qwen/qwen2.5-72b-instruct",
-    "qwen/qwen2.5-7b-instruct",
-    "qwen/qwen3.5-397b-a17b",
+    "nvidia/riva-translate-4b-instruct-v2",
+    "meta/llama-3.3-70b-instruct",
     "meta/llama-3.1-70b-instruct",
     "meta/llama-3.1-8b-instruct",
+    "nvidia/llama-3.3-nemotron-super-49b-v1.5",
+    "mistralai/mistral-medium-3.5-128b",
+    "qwen/qwen2.5-72b-instruct",
+    "qwen/qwen2.5-7b-instruct",
 ]
+
+# Riva system prompt uses lowercase pairs like "en-zh-cn" / "zh-cn-en".
+_RIVA_LANG = {
+    "en": "en",
+    "zh": "zh-cn",
+    "zh-CN": "zh-cn",
+    "zh-TW": "zh-tw",
+    "ja": "ja",
+    "ko": "ko",
+    "es": "es-ES",
+    "fr": "fr",
+    "de": "de",
+    "pt": "pt-BR",
+    "pt-BR": "pt-BR",
+    "pt-PT": "pt-PT",
+    "ru": "ru",
+    "ar": "ar",
+    "hi": "hi",
+    "th": "th",
+    "vi": "vi",
+    "it": "it",
+    "nl": "nl",
+    "cs": "cs",
+    "da": "da",
+    "el": "el",
+    "fi": "fi",
+    "hu": "hu",
+    "lt": "lt",
+    "lv": "lv",
+    "no": "no",
+    "pl": "pl",
+    "ro": "ro",
+    "sk": "sk",
+    "sv": "sv",
+    "et": "et",
+    "sl": "sl",
+    "bg": "bg",
+    "uk": "uk",
+    "hr": "hr",
+    "tr": "tr",
+    "id": "id",
+}
+
+
+def is_riva_model(model: str) -> bool:
+    return (model or "").lower().startswith("nvidia/riva-translate")
+
+
+def riva_lang_pair(src: str, tgt: str) -> str:
+    """Map app language codes to Riva's system prompt pair (e.g. en-zh-cn)."""
+
+    def norm(code: str) -> str:
+        c = (code or "en").strip()
+        if c in _RIVA_LANG:
+            return _RIVA_LANG[c]
+        low = c.lower()
+        for k, v in _RIVA_LANG.items():
+            if k.lower() == low:
+                return v
+        return low.replace("_", "-")
+
+    return f"{norm(src)}-{norm(tgt)}"
 
 LANG_NAMES = {
     "auto": "Auto-detect",
@@ -247,6 +314,9 @@ def translate_batch(client, model, lines, src, tgt, context, start_index=0, max_
     if not lines:
         return []
 
+    if is_riva_model(model):
+        return _translate_batch_riva(client, model, lines, src, tgt, start_index, max_retries)
+
     indices = list(range(start_index, start_index + len(lines)))
     system_prompt = SYSTEM_PROMPT_TMPL.format(
         src=lang_name(src),
@@ -277,6 +347,12 @@ def translate_batch(client, model, lines, src, tgt, context, start_index=0, max_
             return _parse_numbered(content, indices)
         except Exception as e:
             msg = str(e)
+            if _is_model_not_found(msg):
+                raise RuntimeError(
+                    f"Model not found (404): {model!r}. "
+                    "Pick another model in the UI, or set NVIDIA_MODEL in .env. "
+                    f"Recommended: {DEFAULT_MODEL}"
+                ) from e
             is_empty = "empty content" in msg
             is_align = "Could not align" in msg
             if is_align or (is_empty and attempt + 1 >= max_retries):
@@ -310,6 +386,69 @@ def translate_batch(client, model, lines, src, tgt, context, start_index=0, max_
     )
 
 
+def _is_model_not_found(msg: str) -> bool:
+    low = (msg or "").lower()
+    return "404" in low and ("not found" in low or "page not found" in low)
+
+
+def _translate_batch_riva(client, model, lines, src, tgt, start_index=0, max_retries=3):
+    """Riva NMT: system prompt is a lang pair (en-zh-cn); one cue per request."""
+    pair = riva_lang_pair(src, tgt)
+    print(f"  [riva] {model}  pair={pair}  cues={len(lines)} (from @{start_index})", flush=True)
+    out = []
+    for i, line in enumerate(lines):
+        idx = start_index + i
+        if not (line or "").strip():
+            out.append("")
+            continue
+        # Preserve multi-line cues; raw newlines get flattened by Riva.
+        payload = line.replace("\n", " / ")
+        translated = None
+        for attempt in range(max_retries):
+            try:
+                response = client.chat.completions.create(
+                    model=model,
+                    temperature=0.2,
+                    max_tokens=min(2048, 80 + 60 * max(1, len(payload.split()))),
+                    messages=[
+                        {"role": "system", "content": pair},
+                        {"role": "user", "content": payload},
+                    ],
+                )
+                content = (_message_text(response.choices[0]) or "").strip()
+                if not content:
+                    raise ValueError("empty content")
+                translated = content.replace(" / ", "\n")
+                break
+            except Exception as e:
+                msg = str(e)
+                if _is_model_not_found(msg):
+                    raise RuntimeError(
+                        f"Model not found (404): {model!r}. "
+                        "Pick another model in the UI, or set NVIDIA_MODEL in .env. "
+                        f"Recommended: {DEFAULT_MODEL}"
+                    ) from e
+                is_rate = "429" in msg or "rate" in msg.lower()
+                wait = (_retry_after_seconds(msg) or random.uniform(5, 20)) if is_rate else (2 ** attempt)
+                wait += random.uniform(0, 0.5)
+                print(
+                    f"  [warn] riva@{idx} failed ({e}); retrying in {wait:.1f}s...",
+                    file=sys.stderr,
+                )
+                time.sleep(wait)
+        if translated is None:
+            print(f"  [warn] giving up on riva line {idx}: {line!r}", file=sys.stderr)
+            translated = line
+        # Compact sample log so the UI Log tab shows real activity.
+        src_show = payload if len(payload) <= 60 else payload[:57] + "…"
+        tgt_show = translated.replace("\n", " / ")
+        if len(tgt_show) > 60:
+            tgt_show = tgt_show[:57] + "…"
+        print(f"  [riva] {idx:04d}  {src_show}  →  {tgt_show}", flush=True)
+        out.append(translated)
+    return out
+
+
 def translate_all(
     client,
     model,
@@ -332,6 +471,17 @@ def translate_all(
     def _cancelled() -> bool:
         return cancel_event is not None and cancel_event.is_set()
 
+    # Riva is sentence-level NMT; numbered multi-cue batches break it.
+    if is_riva_model(model):
+        batch_size = 1
+        print(
+            f"  Model {model}: using Riva NMT mode "
+            f"({riva_lang_pair(src, tgt)}, 1 cue/request, workers={workers})",
+            flush=True,
+        )
+    else:
+        print(f"  Model {model}: chat translate {src} → {tgt}, batch_size={batch_size}, workers={workers}", flush=True)
+
     # Collect the unique non-empty cue texts, preserving first-seen order.
     unique_texts = []
     seen = {}
@@ -349,6 +499,7 @@ def translate_all(
     done_batches = 0
     if progress_cb is not None:
         progress_cb(0, total_batches)
+    print(f"  Translating {len(unique_texts)} unique cues in {total_batches} request(s)...", flush=True)
 
     if _cancelled():
         raise RuntimeError("Cancelled")
@@ -690,12 +841,16 @@ def merge_subs(
     order: str = "source-top",
     min_overlap_ms: int = 80,
     include_unmatched: bool = True,
+    missing_out: list | None = None,
 ) -> pysubs2.SSAFile:
     """
     Fuse two subtitle files into dual-line cues using time overlap.
 
     Primary supplies the timing spine. For each primary cue, overlapping
     secondary cue text is attached. Optionally append unmatched secondary cues.
+
+    If missing_out is provided, it is filled with (cue_index, side) pairs for
+    single-language cues, where side is "primary" or "secondary".
     """
     dual = pysubs2.SSAFile()
     # Preserve styles from primary when present (ASS).
@@ -703,6 +858,8 @@ def merge_subs(
     dual.info = copy.deepcopy(primary.info)
 
     used_secondary = set()
+    # Track which dual events are single-language before the final sort.
+    pending_missing: list[tuple[pysubs2.SSAEvent, str]] = []
 
     for p in primary:
         matches = []
@@ -725,12 +882,20 @@ def merge_subs(
             continue
         if top and bottom:
             text = f"{top}\n{bottom}"
+            side = None
         else:
             text = top or bottom
+            # source-top: top=primary; target-top: top=secondary
+            if order == "source-top":
+                side = "primary" if top else "secondary"
+            else:
+                side = "secondary" if top else "primary"
 
         event = copy.deepcopy(p)
         event.plaintext = text
         dual.append(event)
+        if side:
+            pending_missing.append((event, side))
 
     if include_unmatched:
         for si, s in enumerate(secondary):
@@ -742,23 +907,106 @@ def merge_subs(
             event = copy.deepcopy(s)
             event.plaintext = text
             dual.append(event)
+            pending_missing.append((event, "secondary"))
 
     dual.sort()
+    if missing_out is not None:
+        missing_out.clear()
+        # Re-resolve indices after sort by object identity.
+        id_to_side = {id(ev): side for ev, side in pending_missing}
+        for i, ev in enumerate(dual):
+            side = id_to_side.get(id(ev))
+            if side:
+                missing_out.append((i, side))
     return dual
 
 
-def process_merge(args, path_a: Path, path_b: Path):
+def _stack_filled_pair(existing: str, translated: str, existing_is_primary: bool, order: str) -> str:
+    """Place existing + AI translation using the same order rules as merge."""
+    if order == "source-top":
+        top, bottom = (existing, translated) if existing_is_primary else (translated, existing)
+    else:
+        top, bottom = (translated, existing) if existing_is_primary else (existing, translated)
+    return f"{top}\n{bottom}"
+
+
+def fill_missing_cues(
+    dual: pysubs2.SSAFile,
+    missing: list[tuple[int, str]],
+    client,
+    *,
+    primary_lang: str,
+    secondary_lang: str,
+    order: str = "source-top",
+    model: str = DEFAULT_MODEL,
+    context: str = "",
+    batch_size: int = 20,
+    workers: int = 6,
+    cancel_event=None,
+    progress_cb=None,
+) -> pysubs2.SSAFile:
+    """
+    Translate unpaired merge cues so each becomes a dual-language stacked cue.
+
+    missing entries are (index, "primary"|"secondary") from merge_subs.
+    """
+    if not missing:
+        return dual
+
+    out = copy.deepcopy(dual)
+    # Group by translation direction so we can batch efficiently.
+    groups: dict[tuple[str, str], list[tuple[int, str, bool]]] = {}
+    for idx, side in missing:
+        if idx < 0 or idx >= len(out):
+            continue
+        text = (out[idx].plaintext or "").strip()
+        if not text or "\n" in (out[idx].plaintext or ""):
+            continue
+        if side == "primary":
+            src, tgt, is_primary = primary_lang, secondary_lang, True
+        else:
+            src, tgt, is_primary = secondary_lang, primary_lang, False
+        groups.setdefault((src, tgt), []).append((idx, text, is_primary))
+
+    total = sum(len(v) for v in groups.values())
+    print(f"  Filling {total} unpaired cue(s) with AI ({primary_lang} ↔ {secondary_lang})...")
+
+    for (src, tgt), jobs in groups.items():
+        lines = [text for _, text, _ in jobs]
+        translations = translate_all(
+            client,
+            model,
+            lines,
+            src,
+            tgt,
+            context,
+            batch_size,
+            workers=workers,
+            cancel_event=cancel_event,
+            progress_cb=progress_cb,
+        )
+        for (idx, text, is_primary), translated in zip(jobs, translations):
+            translated = (translated or "").strip() or text
+            out[idx].plaintext = _stack_filled_pair(text, translated, is_primary, order)
+
+    return out
+
+
+def process_merge(args, path_a: Path, path_b: Path, cancel_event=None, progress_cb=None):
     print(f"\n=== merge: {path_a.name} + {path_b.name} ===")
 
     a, b = path_a, path_b
     if a.suffix.lower() not in SUPPORTED_EXTS or b.suffix.lower() not in SUPPORTED_EXTS:
         raise RuntimeError("Both merge inputs must be subtitle files (.srt/.vtt/.ass/.ssa).")
 
+    fill_missing = bool(getattr(args, "fill_missing", False))
+
     subs_a = load_subs(a)
     subs_b = load_subs(b)
     script_a, script_b = detect_script(subs_a), detect_script(subs_b)
-    print(f"  {a.name}: {len(subs_a)} cues ({script_a})")
-    print(f"  {b.name}: {len(subs_b)} cues ({script_b})")
+    lang_a, lang_b = detect_language(subs_a), detect_language(subs_b)
+    print(f"  {a.name}: {len(subs_a)} cues ({script_a}, {lang_a})")
+    print(f"  {b.name}: {len(subs_b)} cues ({script_b}, {lang_b})")
 
     # Manual --shift-ms always targets Subtitle 2 / FILE_2 (subs_b), applied
     # before spine selection so the semantics are stable regardless of swaps.
@@ -770,10 +1018,12 @@ def process_merge(args, path_a: Path, path_b: Path):
     if script_a == "cjk" and script_b == "latin":
         primary, secondary = subs_b, subs_a
         primary_path, secondary_path = b, a
+        primary_lang, secondary_lang = lang_b, lang_a
         print("  Detected: Latin timing spine + CJK partner (swapped order)")
     else:
         primary, secondary = subs_a, subs_b
         primary_path, secondary_path = a, b
+        primary_lang, secondary_lang = lang_a, lang_b
         if script_a == "latin" and script_b == "cjk":
             print("  Detected: Latin timing spine + CJK partner")
         else:
@@ -785,13 +1035,34 @@ def process_merge(args, path_a: Path, path_b: Path):
         if estimated:
             secondary = _shift_subs(secondary, estimated)
 
+    missing: list[tuple[int, str]] = []
     dual = merge_subs(
         primary,
         secondary,
         order=args.order,
         min_overlap_ms=args.min_overlap_ms,
         include_unmatched=not args.drop_unmatched,
+        missing_out=missing if fill_missing else None,
     )
+
+    if fill_missing and missing:
+        client = get_client()
+        dual = fill_missing_cues(
+            dual,
+            missing,
+            client,
+            primary_lang=primary_lang,
+            secondary_lang=secondary_lang,
+            order=args.order,
+            model=getattr(args, "model", DEFAULT_MODEL) or DEFAULT_MODEL,
+            context=getattr(args, "context", "") or "",
+            batch_size=int(getattr(args, "batch_size", 20) or 20),
+            workers=int(getattr(args, "workers", 6) or 6),
+            cancel_event=cancel_event,
+            progress_cb=progress_cb,
+        )
+    elif fill_missing:
+        print("  No unpaired cues to fill.")
 
     fmt = getattr(args, "format", "srt") or "srt"
     layout = getattr(args, "layout", "stacked") or "stacked"
@@ -807,7 +1078,7 @@ def process_merge(args, path_a: Path, path_b: Path):
 
     out_path = save_dual(dual, out_path, fmt, layout=layout)
     matched = sum(1 for e in dual if "\n" in (e.plaintext or ""))
-    print(f"  -> {out_path.name}  ({len(dual)} cues, {matched} stacked-source cues, format={fmt}, layout={layout})")
+    print(f"  -> {out_path.name}  ({len(dual)} cues, {matched} stacked cues, format={fmt}, layout={layout})")
     return out_path
 
 
@@ -1174,6 +1445,14 @@ class DualSubsApp(_TkBase):
             variable=self.drop_unmatched,
             command=lambda: self._schedule_preview(delay_ms=100),
         ).grid(row=2, column=0, columnspan=2, sticky=tk.W)
+
+        self.fill_missing = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            self.sync_frame,
+            text="Fill missing cues with AI Translate (needs API key)",
+            variable=self.fill_missing,
+            command=lambda: self._schedule_preview(delay_ms=100),
+        ).grid(row=3, column=0, columnspan=2, sticky=tk.W, pady=(4, 0))
 
         # Actions
         actions = ttk.Frame(root)
@@ -2119,11 +2398,16 @@ class DualSubsApp(_TkBase):
         single_count = len(dual) - dual_count
         match_pct = (100.0 * dual_count / len(primary)) if primary else 0.0
 
+        fill_note = ""
+        if self.fill_missing.get() and single_count:
+            fill_note = f"  ·  AI will fill {single_count} on Run"
+
         self.preview_meta.configure(
             text=(
                 f"Combined preview  ·  spine={spine_name} + {other_name}  ·  "
                 f"{dual_count}/{len(primary)} paired ({match_pct:.0f}%)"
                 + (f"  ·  {single_count} unpaired in spine" if single_count else "")
+                + fill_note
             )
         )
 
@@ -2182,6 +2466,7 @@ class DualSubsApp(_TkBase):
             auto_shift=bool(self.auto_shift.get()),
             min_overlap_ms=80,
             drop_unmatched=bool(self.drop_unmatched.get()),
+            fill_missing=bool(self.fill_missing.get()),
             format=self.dual_format.get() or "srt",
             layout=self.dual_layout.get() or "stacked",
         )
@@ -2213,6 +2498,13 @@ class DualSubsApp(_TkBase):
             return
 
         args = self._make_args()
+        if mode == "merge" and args.fill_missing and not os.environ.get("NVIDIA_API_KEY"):
+            messagebox.showerror(
+                "API key required",
+                "Fill missing cues with AI needs NVIDIA_API_KEY in a .env file next to dual_subs.py.",
+            )
+            return
+
         self.notebook.select(1)
         self._append_log(f"\n--- {mode} ---\n")
         self._cancel_event.clear()
@@ -2225,7 +2517,13 @@ class DualSubsApp(_TkBase):
             out_path = None
             try:
                 if mode == "merge":
-                    out_path = process_merge(args, Path(path_a), Path(path_b))
+                    out_path = process_merge(
+                        args,
+                        Path(path_a),
+                        Path(path_b),
+                        cancel_event=self._cancel_event,
+                        progress_cb=self._progress_cb,
+                    )
                 else:
                     if mode == "translate" and not os.environ.get("NVIDIA_API_KEY"):
                         raise RuntimeError(
@@ -2320,6 +2618,11 @@ def parse_args():
         "--drop-unmatched",
         action="store_true",
         help="With --merge: drop cues from the second file that don't overlap anything",
+    )
+    parser.add_argument(
+        "--fill-missing",
+        action="store_true",
+        help="With --merge: AI-translate unpaired cues so both languages are present (needs NVIDIA_API_KEY)",
     )
     parser.add_argument(
         "--source-lang",

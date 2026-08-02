@@ -55,7 +55,7 @@ cp .env.example .env   # Windows: copy .env.example .env
 Optional env overrides in `.env`:
 
 ```
-NVIDIA_MODEL=qwen/qwen2.5-72b-instruct
+NVIDIA_MODEL=nvidia/riva-translate-4b-instruct-v2
 NVIDIA_BASE_URL=https://integrate.api.nvidia.com/v1
 ```
 
@@ -75,7 +75,7 @@ On Windows, prefer `Dual Subs UI.bat` after `setup.bat` so the venv is used.
 | Mode | What it does | API key |
 |---|---|---|
 | **Translate (AI)** | Translate one subtitle file into a dual file | Required |
-| **Merge two files** | Fuse Subtitle 1 + Subtitle 2 by time overlap | Not needed |
+| **Merge two files** | Fuse Subtitle 1 + Subtitle 2 by time overlap (optional AI fill for gaps) | Only if filling missing cues |
 | **Edit** | Full cue editor (text, times, add/delete) → Save / Save as | Not needed |
 
 ### Options
@@ -85,7 +85,7 @@ On Windows, prefer `Dual Subs UI.bat` after `setup.bat` so the venv is used.
 - **Line order** — `source-top` or `target-top`
 - **Dual format** — `srt` or `ass`
 - **Dual layout** — `stacked` (two lines per cue, default) or `single-line` (`ZH \| EN`)
-- **Model** — NIM model picker (default `qwen/qwen2.5-72b-instruct`)
+- **Model** — NIM model picker (default `nvidia/riva-translate-4b-instruct-v2`)
 - **Context** — optional show/movie notes for the translator
 
 **Merge sync** (Merge mode only):
@@ -93,6 +93,7 @@ On Windows, prefer `Dual Subs UI.bat` after `setup.bat` so the venv is used.
 - **Auto-shift** — estimate a global sync offset when tracks are misaligned
 - **Shift ms (Subtitle 2)** — manual offset applied to Subtitle 2 before spine selection
 - **Drop unmatched** — omit Subtitle 2 cues that don’t overlap anything
+- **Fill missing cues with AI Translate** — translate unpaired cues so both languages are present (needs API key)
 
 ### Edit mode
 
@@ -123,13 +124,14 @@ After a successful Translate or Merge, **Edit result** opens the dual output fil
 python dual_subs.py movie.srt
 python dual_subs.py movie.srt --target-lang zh-TW --order target-top
 python dual_subs.py movie.srt --context "The Amazing Spider-Man (2012), casual teen dialogue"
-python dual_subs.py movie.srt --model qwen/qwen2.5-7b-instruct
+python dual_subs.py movie.srt --model meta/llama-3.1-8b-instruct
 
 # Merge (no API key)
 python dual_subs.py --merge movie.en.srt movie.zh.srt
 python dual_subs.py --merge movie.en.srt movie.zh.srt -o movie.dual.srt
 python dual_subs.py --merge movie.en.srt movie.zh.srt --order target-top
 python dual_subs.py --merge a.srt b.srt --shift-ms -400 --auto-shift
+python dual_subs.py --merge en.srt zh.srt --fill-missing   # AI-fill unpaired cues
 ```
 
 ### Flags
@@ -141,7 +143,7 @@ python dual_subs.py --merge a.srt b.srt --shift-ms -400 --auto-shift
 | `--order` | `source-top` | Line order: `source-top` or `target-top` |
 | `--format` | `srt` | Dual output: `srt` or `ass` |
 | `--layout` | `stacked` | `stacked` or `single-line` |
-| `--model` | `qwen/qwen2.5-72b-instruct` | NIM model id ([catalog](https://build.nvidia.com/models)) |
+| `--model` | `nvidia/riva-translate-4b-instruct-v2` | NIM model id ([catalog](https://build.nvidia.com/models)) |
 | `--batch-size` | `20` | Cues per API request |
 | `--workers` | `6` | Parallel API requests |
 | `--merge FILE_1 FILE_2` | — | Fuse two tracks into dual (time-sync, no API) |
@@ -150,6 +152,7 @@ python dual_subs.py --merge a.srt b.srt --shift-ms -400 --auto-shift
 | `--shift-ms` | `0` | Manual offset (ms) for **FILE_2 / Subtitle 2** (before spine selection) |
 | `--min-overlap-ms` | `80` | Minimum overlap to pair cues when merging |
 | `--drop-unmatched` | off | Drop FILE_2 cues that don’t overlap anything |
+| `--fill-missing` | off | With `--merge`: AI-translate unpaired cues (needs API key) |
 | `--context` | _(none)_ | Movie/show notes for the translator |
 | `--ui` | off | Launch the desktop UI |
 
@@ -168,8 +171,9 @@ CLI exits with status `1` if any input fails.
 1. Applies manual `--shift-ms` to FILE_2, then picks a timing spine (prefers Latin when pairing with CJK).
 2. Optionally auto-shifts the secondary track.
 3. Pairs cues by time overlap and writes a dual file.
+4. Optional `--fill-missing` / UI checkbox: AI-translates unpaired cues so both languages are present.
 
-Default model: `qwen/qwen2.5-72b-instruct`. The older `qwen/qwen3.5-397b-a17b` remains selectable in the UI / via `--model`. Override the default globally with `NVIDIA_MODEL` in `.env`.
+Default model: `nvidia/riva-translate-4b-instruct-v2` (dedicated NMT). Qwen free endpoints often 404 now; override with `NVIDIA_MODEL` in `.env` or the UI picker.
 
 ## Tests
 
